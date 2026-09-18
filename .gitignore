@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+coverage/
+
+# Not committed on purpose: while salt-agent-sdk's public npm version (0.1.0)
+# lags behind this repo's target (^0.7.1), a local install records a
+# `"link": true` entry pointing at "../salt-agent-sdk" -- a path that only
+# exists on a machine with that sibling checkout. Regenerate locally with
+# `npm install && npm install ../salt-agent-sdk --no-save`. Recommit this
+# file once salt-agent-sdk 0.7.1+ is actually published. See AGENTS.md.
+package-lock.json

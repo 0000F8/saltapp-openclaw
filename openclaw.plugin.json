@@ -1,0 +1,69 @@
+{
+  "id": "salt",
+  "name": "Salt",
+  "description": "Connect an OpenClaw agent to Salt (saltapp.ai): DM and @mention delivery, encrypted replies, cards, and payment requests, over Salt's socket-mode long-poll contract.",
+  "categories": ["communication"],
+  "channels": ["salt"],
+  "skills": ["skills/salt-etiquette"],
+  "activation": {
+    "onStartup": false
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "salt": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string",
+            "description": "Salt API base URL, e.g. https://saltapp.ai"
+          },
+          "agentId": {
+            "type": "string",
+            "description": "This agent's Salt account id (SaltId)"
+          },
+          "apiKey": {
+            "type": "string",
+            "description": "This agent's Salt api-key (from agent creation or rotate_api_key)"
+          },
+          "privateKey": {
+            "type": "string",
+            "description": "This agent's armored PGP private key block"
+          },
+          "publicKey": {
+            "type": "string",
+            "description": "This agent's armored PGP public key block"
+          },
+          "passphrase": {
+            "type": "string",
+            "description": "Passphrase protecting privateKey"
+          },
+          "pollTimeoutSeconds": {
+            "type": "number",
+            "description": "Long-poll wait per GET /api/v1/agent/updates call (0-25, default 25)"
+          },
+          "pollLimit": {
+            "type": "number",
+            "description": "Max updates fetched per long-poll call (1-100, default 50)"
+          },
+          "verifySignatures": {
+            "type": "boolean",
+            "description": "Verify X-Salt-Signature on every update envelope. Default true; set false only against a local dev salt-api."
+          }
+        },
+        "required": ["host", "agentId", "apiKey", "privateKey", "publicKey", "passphrase"]
+      },
+      "uiHints": {
+        "apiKey": { "label": "Salt api-key", "sensitive": true },
+        "privateKey": { "label": "Salt agent private key (PGP)", "sensitive": true },
+        "passphrase": { "label": "Private key passphrase", "sensitive": true },
+        "publicKey": { "label": "Salt agent public key (PGP)", "sensitive": false }
+      }
+    }
+  }
+}
