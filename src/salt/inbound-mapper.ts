@@ -1,26 +1,19 @@
-// Maps a decrypted Salt `message` webhook/update body into a small,
-// well-defined intermediate shape (`SaltInboundMessage`) that channel.ts's
-// best-effort OpenClaw dispatch call is built from. Kept separate from
-// envelope verification and decryption so it can be unit tested with plain
-// objects -- no crypto, no network.
+// DM-vs-group classification and this plugin's own group-mention etiquette
+// check, both built from the chat metadata salt-agent-sdk's `MessageContext`
+// already hands over (channel.ts's onMessage) -- no crypto, no network
+// (beyond the injectable `fetchMembers` fallback), so this stays a plain,
+// easily unit-testable module.
 //
-// Field provenance (salt-agent-sdk's webhook.ts `handleMessage`, and
-// CLAUDE.md's "Agents" section):
-//   body.message.chat_id       -- SaltId
-//   body.message.message_id    -- SaltId, for dedup (left to the caller)
-//   body.message.message       -- PGP ciphertext (decrypted by the caller
-//                                  before this module ever sees the text)
-//   body.message.user          -- RawSender {id, account_type, ...}
-//   body.message.mentions      -- SaltId[] (jsonb), only ids the client
-//                                  resolved from an @handle -- Salt never
-//                                  sees plaintext, so this is the ONLY
-//                                  reliable mention signal
-//   body.message.event_type    -- present => a system event, not a prompt
-//   body.message.resource_type -- "Attachment" => decrypted separately
-//   body.chat                  -- RawChatMeta; the ordinary message webhook
-//                                  body does NOT inline `users` in
-//                                  production (WebhookJob#user_send's
-//                                  allowlist) -- only chat_opened does.
+// This module used to also map a raw, still-encrypted webhook/update body
+// into an inbound shape (`mapMessageEventToInbound`) -- decrypt, sender,
+// mentions array and all. That's gone now that receiving goes through
+// salt-agent-sdk's `createSocketClient`: identity resolution, decrypt (or
+// pass-through for an open room, `ctx.encrypted === false`), and dispatch
+// all happen inside the SDK, and `channel.ts`'s onMessage handler is handed
+// a `MessageContext` directly. One real loss from that: `MessageContext`
+// does not expose the raw `message.mentions` id array the way a webhook
+// body used to -- see `mentionsSelfByHandle` below for how this plugin
+// approximates it instead.
 
 export type SaltChatKind = "dm" | "group";
 
@@ -34,48 +27,9 @@ export interface RawChatMetaLike {
   coaching_for_chat_id?: string;
   private_lane?: boolean;
   lane_kind?: string;
+  encrypted?: boolean;
   users?: Array<{ id: string; account_type?: string; observer?: boolean }>;
   [key: string]: unknown;
-}
-
-export interface RawSenderLike {
-  id: string;
-  username?: string;
-  display_name?: string;
-  account_type?: "User" | "Agent";
-  [key: string]: unknown;
-}
-
-export interface SaltInboundSender {
-  id: string;
-  handle?: string;
-  displayName?: string;
-  isAgent: boolean;
-}
-
-export interface SaltInboundAttachment {
-  filename: string;
-  contentType: string;
-  size: number;
-}
-
-export interface SaltInboundMessage {
-  chatId: string;
-  /** The shared chat this message's conversation ultimately serves: chatId
-   *  itself, or chatMeta.coaching_for_chat_id when chatId is a lane. */
-  roomId: string;
-  kind: SaltChatKind;
-  sender: SaltInboundSender;
-  text: string;
-  /** True iff this agent's own id is in message.mentions. In a group, an
-   *  OpenClaw agent should only ever answer when this is true (or it's a
-   *  DM) -- see skills/salt-etiquette/SKILL.md. */
-  mentionsSelf: boolean;
-  mentionedIds: string[];
-  isLane: boolean;
-  laneKind?: string;
-  attachment?: SaltInboundAttachment;
-  raw: { chatMeta?: RawChatMetaLike; message: Record<string, unknown> };
 }
 
 export interface ClassifyChatOptions {
@@ -121,52 +75,27 @@ export async function classifyChat(
   return "dm";
 }
 
-export interface MapMessageEventOptions extends ClassifyChatOptions {
-  /** Already-decrypted plaintext (mapping never touches ciphertext or keys). */
-  decryptedText: string;
-  attachment?: SaltInboundAttachment;
-}
-
 /**
- * Maps one decrypted `message` event into `SaltInboundMessage`, or `null`
- * when the row isn't a prompt at all (a system event, or this agent's own
- * echo -- dedup/self-echo is left to the caller since it needs the cursor,
- * not just this one row).
+ * Best-effort "was this agent @mentioned" check for a group message, from
+ * plaintext alone.
+ *
+ * salt-agent-sdk's `MessageContext` (unlike the raw webhook/update body
+ * this plugin used to parse itself) does not surface `message.mentions` --
+ * the structured array of ids Salt's own clients resolve an "@handle" into
+ * client-side (CLAUDE.md: "mentions are detected client-side, server sees
+ * only ciphertext"). Without that array, the only signal left is a literal
+ * "@handle" substring in the decrypted text -- a reasonable approximation
+ * (every first-party Salt client writes the handle into the message body
+ * itself, the ids array rides alongside it) but not exact: it can't catch
+ * a mention Salt's own client attached without also writing "@handle" into
+ * the text, and it can false-positive on a message that merely quotes
+ * "@handle" without meaning to address this agent. Case-insensitive; the
+ * handle must appear as its own token (not merely a substring of a longer
+ * word), matching how "@handle" reads as one unit in a message.
  */
-export async function mapMessageEventToInbound(
-  body: { message: Record<string, unknown>; chat?: RawChatMetaLike },
-  options: MapMessageEventOptions,
-): Promise<SaltInboundMessage | null> {
-  const message = body.message;
-  if (message.event_type) return null; // system event, not a prompt
-
-  const chatId = String(message.chat_id);
-  const chatMeta = body.chat;
-  const senderRaw = message.user as RawSenderLike | undefined;
-  if (!senderRaw) return null;
-
-  const mentionedIds = (Array.isArray(message.mentions) ? (message.mentions as unknown[]) : []).map(String);
-  const mentionsSelf = mentionedIds.some((id) => id.toLowerCase() === options.selfAgentId.toLowerCase());
-
-  const kind = await classifyChat(chatId, chatMeta, options);
-  const roomId = (chatMeta?.coaching_for_chat_id as string | undefined) ?? chatId;
-
-  return {
-    chatId,
-    roomId,
-    kind,
-    sender: {
-      id: String(senderRaw.id),
-      handle: senderRaw.username,
-      displayName: senderRaw.display_name,
-      isAgent: senderRaw.account_type === "Agent",
-    },
-    text: options.decryptedText,
-    mentionsSelf,
-    mentionedIds,
-    isLane: Boolean(chatMeta?.coaching_for_chat_id),
-    laneKind: chatMeta?.lane_kind,
-    attachment: options.attachment,
-    raw: { chatMeta, message },
-  };
+export function mentionsSelfByHandle(text: string, handle: string | undefined): boolean {
+  if (!handle) return false;
+  const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`(^|[^a-zA-Z0-9_])@${escaped}(?![a-zA-Z0-9_])`, "i");
+  return pattern.test(text);
 }

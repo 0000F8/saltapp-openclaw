@@ -4,9 +4,21 @@
 // resolution and onboarding, `security.dm` for who may open a DM,
 // `outbound.attachedResults` for the shared `message` tool's send path,
 // and `registerFull` (wired from index.ts) for everything that needs the
-// running plugin API -- starting the socket-mode long-poll bridge and
+// running plugin API -- starting the Salt socket connection and
 // registering the two Salt-specific tools (post a card, request a
 // payment).
+//
+// Receiving used to be this plugin's own hand-rolled short-poll loop
+// (verify envelope HMAC, decrypt, map to an inbound shape). Owner rule:
+// "DO NOT USE POLLING as a mechanic EVER." This now holds a single
+// salt-agent-sdk `createSocketClient` connection -- a real Action Cable
+// websocket to salt-api's `AgentUpdatesChannel` -- for the whole life of
+// the process; an idle, caught-up agent makes zero requests. Envelope
+// verification, decrypt-or-pass-through (open rooms), identity
+// resolution, cursor persistence and dedupe are all the SDK's job now;
+// this file's own onMessage handler only adds OpenClaw-specific policy on
+// top (group @mention etiquette) and maps into OpenClaw's inbound shape.
+// See HANDOFF.md.
 //
 // SDK-INTEGRATION-GUESS markers below call out exactly where this plugin
 // guesses at the real compiled SDK's contract instead of citing verified
@@ -19,17 +31,37 @@ import {
   type OpenClawPluginApi,
 } from "openclaw/plugin-sdk/channel-core";
 import { runChannelInboundEvent } from "openclaw/plugin-sdk/channel-inbound";
-import { createSaltClient, decrypt, encryptFor, type SaltClient } from "salt-agent-sdk";
-import { createFileCursorStore, resolveSaltCursorDir } from "./salt/cursor-store.js";
-import { mapMessageEventToInbound, type RawChatMetaLike } from "./salt/inbound-mapper.js";
 import {
-  fetchAgentUpdates,
-  setDeliveryMode,
+  createSaltClient,
+  createSocketClient,
+  encryptFor,
+  FileCursorStore,
+  FileDedupeStore,
+  sameId,
+  type AgentIdentity,
+  type ChatOpenedContext,
+  type IdentityStore,
+  type MessageContext,
+  type SaltClient,
+  type SaltId,
+  type SocketClient,
+} from "salt-agent-sdk";
+import { resolveSaltCursorDir } from "./salt/cursor-store.js";
+import { classifyChat, mentionsSelfByHandle, type RawChatMetaLike } from "./salt/inbound-mapper.js";
+import {
+  createPaymentRequest,
+  getPublicConfig,
+  isOpenRoom,
+  joinPublicChat,
   type SaltRestOptions,
 } from "./salt/rest.js";
-import { createSocketPoller, type VerifiedUpdate } from "./salt/socket-poller.js";
 import { sendEncryptedReply, signalTypingSafely } from "./salt/outbound.js";
 import { createSaltPostCardTool, createSaltRequestPaymentTool } from "./salt/tools.js";
+
+export interface SaltInterests {
+  mode: "addressed" | "keywords" | "all";
+  keywords?: string[];
+}
 
 export interface SaltAccount {
   host: string;
@@ -38,9 +70,23 @@ export interface SaltAccount {
   privateKey: string;
   publicKey: string;
   passphrase: string;
-  pollTimeoutSeconds: number;
+  /** This agent's own Salt @handle (no leading @) -- used for this
+   *  plugin's own group @mention etiquette (see inbound-mapper.ts's
+   *  mentionsSelfByHandle). Without it, group messages are never
+   *  answered. */
+  handle?: string;
+  /** Backfill page size when reconnecting with a stale cursor. NOT a poll
+   *  interval -- the socket connection itself pushes; this only bounds
+   *  how many rows one catch-up page fetches at a time. */
   pollLimit: number;
   verifySignatures: boolean;
+  /** Join Salt's Commons (the shared open/unencrypted public room) on
+   *  startup and apply `interests` to it. */
+  joinCommons: boolean;
+  /** This agent's delivery preference for open rooms -- applied to the
+   *  Commons on join, and to any other open room this agent is later
+   *  added to (see createChatOpenedHandler). */
+  interests?: SaltInterests;
 }
 
 const REQUIRED_FIELDS = ["host", "agentId", "apiKey", "privateKey", "publicKey", "passphrase"] as const;
@@ -54,6 +100,7 @@ export function resolveAccount(cfg: OpenClawConfig, _accountId?: string | null):
   for (const field of REQUIRED_FIELDS) {
     if (!section[field]) throw new Error(`salt: ${field} is required (set channels.salt.${field})`);
   }
+  const interests = section.interests as { mode?: string; keywords?: string[] } | undefined;
   return {
     host: String(section.host),
     agentId: String(section.agentId),
@@ -61,14 +108,13 @@ export function resolveAccount(cfg: OpenClawConfig, _accountId?: string | null):
     privateKey: String(section.privateKey),
     publicKey: String(section.publicKey),
     passphrase: String(section.passphrase),
-    // Round-4 socket contract (LANES.md K2): salt-api clamps this
-    // server-side to 0..2s regardless of what's sent -- 25 was a
-    // pre-round-4 long-poll assumption. An operator's own explicit value
-    // still passes through unclamped here (the server is authoritative);
-    // only the default changes.
-    pollTimeoutSeconds: Number(section.pollTimeoutSeconds ?? 2),
-    pollLimit: Number(section.pollLimit ?? 50),
+    handle: section.handle ? String(section.handle) : undefined,
+    // Backfill page size (SocketClientOptions#limit); 100 matches
+    // salt-agent-sdk's own default.
+    pollLimit: Number(section.pollLimit ?? 100),
     verifySignatures: section.verifySignatures !== false,
+    joinCommons: section.joinCommons === true,
+    interests: interests?.mode ? { mode: interests.mode as SaltInterests["mode"], keywords: interests.keywords } : undefined,
   };
 }
 
@@ -82,6 +128,14 @@ export function inspectAccount(cfg: OpenClawConfig, _accountId?: string | null):
     privateKeyStatus: section.privateKey ? "available" : "missing",
   };
 }
+
+// Filled in by startSaltChannel once the plugin actually starts (see that
+// function). `saltChannelPlugin` below is built once, at module load time,
+// before that ever runs -- `outbound.attachedResults.sendText`'s closure
+// reads `runtimeRef.current` at CALL time rather than capturing it, so the
+// ordering is fine (a plain module-scoped mutable box, not a stale
+// closure-captured value).
+const runtimeRef: { current?: SaltRuntimeDeps } = {};
 
 export const saltChannelPlugin = createChatChannelPlugin<SaltAccount>({
   base: createChannelPluginBase<SaltAccount>({
@@ -130,39 +184,43 @@ export const saltChannelPlugin = createChatChannelPlugin<SaltAccount>({
     attachedResults: {
       channel: "salt",
       // SDK-INTEGRATION-GUESS: the doc's `sendText` receives `params.to`/
-      // `params.text` and nothing else; this plugin does NOT yet have a
-      // verified way to recover the current account's client/identity
-      // from inside this closure alone (no `context` argument shown in
-      // the doc's example). `createRuntimeSaltDeps` below is the real,
-      // fully-wired send path used by the socket bridge's own replies;
-      // wire this closure to the same running client once that accessor
-      // is confirmed. See HANDOFF.md.
+      // `params.text` and nothing else; no `context` argument gives this
+      // closure the running client/identity directly, so it reads
+      // `runtimeRef.current` (set once by startSaltChannel) instead. The
+      // actual branching logic is `sendChannelText` below, kept separate
+      // and directly unit-testable with mock deps rather than requiring a
+      // full `startSaltChannel` (which opens a real socket).
       sendText: async (params) => {
-        throw new Error(
-          "salt channel plugin: outbound.attachedResults.sendText is not wired yet -- " +
-            "see HANDOFF.md's open questions (recovering the running SaltClient/identity " +
-            `from this closure). Attempted to send to ${params.to}.`,
-        );
+        const deps = runtimeRef.current;
+        if (!deps) {
+          throw new Error(
+            "salt channel plugin: outbound.attachedResults.sendText was called before the channel finished " +
+              `starting (registerFull's startSaltChannel hasn't run yet). Attempted to send to ${params.to}.`,
+          );
+        }
+        return sendChannelText(deps, params);
       },
     },
   },
 });
 
 // ---------------------------------------------------------------------
-// Runtime wiring: socket bridge + tools. Called from index.ts's
+// Runtime wiring: socket connection + tools. Called from index.ts's
 // `registerFull`, which is the doc's designated place for anything that
 // needs the live plugin API rather than just manifest/schema metadata.
 // ---------------------------------------------------------------------
 
+export interface Logger {
+  info(msg: string): void;
+  error(msg: string): void;
+}
+
 export interface SaltRuntimeDeps {
   client: SaltClient;
+  identity: AgentIdentity;
   restOptions: SaltRestOptions;
   account: SaltAccount;
-  logger?: { info: (msg: string) => void; error: (msg: string) => void };
-  /** Injectable so tests can stub decryption instead of round-tripping
-   *  real OpenPGP through fake ciphertext. Defaults to salt-agent-sdk's
-   *  own `decrypt`. */
-  decrypt: (armoredMessage: string, armoredPrivateKey: string, passphrase: string) => Promise<string>;
+  logger?: Logger;
 }
 
 export function createSaltRuntimeDeps(api: OpenClawPluginApi): SaltRuntimeDeps {
@@ -170,105 +228,218 @@ export function createSaltRuntimeDeps(api: OpenClawPluginApi): SaltRuntimeDeps {
   const account = resolveAccount(cfg);
   const client = createSaltClient({ host: account.host });
   const restOptions: SaltRestOptions = { host: account.host, apiKey: account.apiKey };
-  return { client, restOptions, account, logger: console, decrypt };
+  const identity: AgentIdentity = {
+    saltAppId: account.agentId,
+    // AgentIdentity.username is required by the SDK but this plugin's own
+    // config never collects a real Salt username -- only `handle`
+    // (optional, used for this plugin's own @mention heuristic). Falling
+    // back to agentId here is safe: the SDK only uses `username` for
+    // logging/health-endpoint display, never for decrypt/routing (that's
+    // saltAppId).
+    username: account.handle ?? account.agentId,
+    apiKey: account.apiKey,
+    publicKey: account.publicKey,
+    privateKey: account.privateKey,
+  };
+  return { client, restOptions, account, identity, logger: console };
+}
+
+/** A one-identity IdentityStore, kept in memory only -- this plugin's
+ *  "self-held custody" model already stores the private key exactly once,
+ *  in OpenClaw's own config/secret storage (see README.md's Custody
+ *  section); writing a second copy to a JSON file the way
+ *  salt-agent-sdk's own file-backed `createIdentityStore` does would
+ *  duplicate that secret on disk for no benefit (this plugin never spawns
+ *  additional identities at runtime the way salt-claude-agent's roster
+ *  can). */
+function createSingleIdentityStore(identity: AgentIdentity): IdentityStore {
+  let current = identity;
+  return {
+    register(next) {
+      current = next;
+    },
+    get(id) {
+      return sameId(id, current.saltAppId) ? current : undefined;
+    },
+    all() {
+      return [current];
+    },
+    reassignId(from, to) {
+      if (!sameId(from, current.saltAppId)) return undefined;
+      current = { ...current, saltAppId: to };
+      return current;
+    },
+  };
 }
 
 /**
- * Wires one poll->verify->decrypt->map->dispatch cycle's `onUpdate`
- * handler. Split out from `startSaltChannel` so it's independently
- * testable without a real long-poll loop (see channel.test.ts).
+ * Wires the SDK's onMessage handler: this plugin's own group @mention
+ * etiquette (a DM is always answered; a group message is answered only
+ * when this agent's configured `handle` appears as "@handle" in the
+ * plaintext -- see inbound-mapper.ts's mentionsSelfByHandle for why this
+ * is a heuristic, not an exact mentions-array check), then a best-effort
+ * typing signal, then the shared dispatch into OpenClaw's own agent turn
+ * pipeline. Self-echo, system events, and hand-off/session-note wire
+ * markers are already filtered out one layer up, inside the SDK's own
+ * dispatcher, before onMessage is ever called -- this handler only sees
+ * real prompts from someone else.
  */
-export function createUpdateHandler(deps: SaltRuntimeDeps, api: OpenClawPluginApi) {
-  return async (update: VerifiedUpdate): Promise<void> => {
-    if (update.event !== "message") {
-      // card_interaction / invoice_paid / chat_opened / handoff_* events
-      // ride the same envelope but need their own OpenClaw-side surfaces
-      // (a card action, a notification, a fresh conversation greeting).
-      // Only plain messages are mapped to the shared inbound turn pipeline
-      // today -- see HANDOFF.md.
-      deps.logger?.info(`[salt] ignoring unmapped event kind: ${update.event}`);
-      return;
-    }
-
-    const body = update.body as { message: Record<string, unknown>; chat?: RawChatMetaLike };
-    const ciphertext = body.message?.message;
-    if (typeof ciphertext !== "string") return;
-
-    const decryptedText = await deps.decrypt(ciphertext, deps.account.privateKey, deps.account.passphrase);
-
-    const inbound = await mapMessageEventToInbound(body, {
+export function createMessageHandler(deps: SaltRuntimeDeps) {
+  let warnedNoHandle = false;
+  return async (ctx: MessageContext): Promise<void> => {
+    const chatId = String(ctx.chatId);
+    const kind = await classifyChat(chatId, ctx.chatMeta as RawChatMetaLike | undefined, {
       selfAgentId: deps.account.agentId,
-      decryptedText,
-      fetchMembers: async (chatId) => {
-        const members = await deps.client.getChatMembers(deps.account.apiKey, chatId);
+      fetchMembers: async (id) => {
+        const members = await deps.client.getChatMembers(deps.account.apiKey, id as SaltId);
         return members.map((m) => ({ id: String(m.id), account_type: m.account_type }));
       },
     });
-    if (!inbound) return;
 
-    // Never auto-answer an unaddressed message in a group -- agents in
-    // groups only see @mentions; see skills/salt-etiquette/SKILL.md.
-    if (inbound.kind === "group" && !inbound.mentionsSelf) return;
-    // Our own echo (this agent is also a chat member, so its own posted
-    // reply comes back through the same feed) -- never reply to ourselves.
-    if (inbound.sender.id.toLowerCase() === deps.account.agentId.toLowerCase()) return;
+    // mentionsSelf always reflects the literal "@handle" heuristic (see
+    // mentionsSelfByHandle) -- independent of DM vs group, same as the raw
+    // mentions-array field this replaced used to be. It's the GATE below,
+    // not this value, that decides whether a group message forwards at
+    // all: a DM always forwards regardless of mentionsSelf.
+    const mentionsSelf = mentionsSelfByHandle(ctx.text, deps.account.handle);
+    if (kind === "group" && !mentionsSelf) {
+      if (!deps.account.handle && !warnedNoHandle) {
+        warnedNoHandle = true;
+        deps.logger?.error(
+          '[salt] a group message arrived with no configured "handle" -- this agent cannot tell whether it was ' +
+            "@mentioned, so group messages will not be answered until channels.salt.handle is set to this agent's " +
+            "own Salt @handle. DMs are unaffected.",
+        );
+      }
+      return;
+    }
 
-    await signalTypingSafely(
-      (chatId) => deps.client.signalTyping(deps.account.apiKey, chatId),
-      inbound.chatId,
-      deps.logger,
-    );
+    await signalTypingSafely((id) => deps.client.signalTyping(deps.account.apiKey, id as SaltId), chatId, deps.logger);
 
     // SDK-INTEGRATION-GUESS: see src/types/openclaw-plugin-sdk.d.ts's
     // comment on `runChannelInboundEvent` -- this call's parameter shape
     // is unverified against the real compiled host.
     await runChannelInboundEvent({
       channelId: "salt",
-      raw: inbound.raw,
-      chatId: inbound.chatId,
-      senderId: inbound.sender.id,
-      text: inbound.text,
-      isGroup: inbound.kind === "group",
-      mentionsSelf: inbound.mentionsSelf,
+      raw: {
+        chatMeta: ctx.chatMeta,
+        sender: ctx.sender,
+        encrypted: ctx.encrypted,
+        roomId: ctx.roomId,
+        // Open rooms (interests): why THIS delivery reached this agent --
+        // "mention"/"reply"/"keyword"/"all" -- present only alongside
+        // `encrypted: false` (salt-agent-sdk 0.10.1's
+        // MessageContext.deliveredBecause; undefined for an ordinary
+        // encrypted chat, where every member gets every message). Read via
+        // a loose cast rather than the typed field: at the time this was
+        // written, salt-agent-sdk's own compiled `dist/` (what this
+        // plugin's `node_modules/salt-agent-sdk` symlink resolves to)
+        // still predated the commit that added this field to `src/`, so
+        // depending on the typed property failed the build here even
+        // though the field is real and merged. Once that sibling repo's
+        // own `dist/` is rebuilt (its own lane's responsibility, not this
+        // plugin's), the real value flows through with no change needed.
+        deliveredBecause: (ctx as unknown as { deliveredBecause?: string }).deliveredBecause,
+      },
+      chatId,
+      senderId: String(ctx.senderId),
+      text: ctx.text,
+      isGroup: kind === "group",
+      mentionsSelf,
     });
   };
 }
 
-export async function startSaltChannel(api: OpenClawPluginApi): Promise<{ stop: () => void }> {
+/**
+ * Open rooms (b, interests): when this agent is newly added to a chat that
+ * turns out to be an open room, apply its configured `interests` to it
+ * automatically -- the same subscription "join the Commons" applies at
+ * startup, generalized to any open room this agent joins later (a group
+ * invite, not just the Commons).
+ */
+export function createChatOpenedHandler(deps: SaltRuntimeDeps) {
+  return async (ctx: ChatOpenedContext): Promise<void> => {
+    if (!deps.account.interests) return;
+    const chat = ctx.chat as { encrypted?: boolean };
+    if (chat.encrypted !== false) return; // only an open room carries a subscription at all
+    try {
+      await deps.client.setChatSubscription(deps.account.apiKey, ctx.chatId, deps.account.interests);
+    } catch (err) {
+      deps.logger?.error(`[salt] setChatSubscription for newly-opened open room ${ctx.chatId} failed: ${(err as Error).message}`);
+    }
+  };
+}
+
+/** "Join the Commons" setup step (e): reads `commons_chat_id` off the
+ *  public `GET /api/v1/config`, joins it, and applies `interests` to it.
+ *  Best-effort -- logged and swallowed on failure so a Commons outage or
+ *  an unconfigured deployment never blocks the plugin from loading. */
+async function joinCommons(deps: SaltRuntimeDeps): Promise<void> {
+  try {
+    const cfg = await getPublicConfig(deps.restOptions);
+    if (!cfg.commons_chat_id) {
+      deps.logger?.error("[salt] joinCommons is set but GET /api/v1/config returned no commons_chat_id -- nothing to join.");
+      return;
+    }
+    await joinPublicChat(deps.restOptions, cfg.commons_chat_id);
+    deps.logger?.info(`[salt] joined the Commons (chat ${cfg.commons_chat_id}).`);
+    if (deps.account.interests) {
+      await deps.client.setChatSubscription(deps.account.apiKey, cfg.commons_chat_id, deps.account.interests);
+    }
+  } catch (err) {
+    deps.logger?.error(`[salt] joining the Commons failed (continuing anyway): ${(err as Error).message}`);
+  }
+}
+
+export async function startSaltChannel(api: OpenClawPluginApi): Promise<{ stop: () => Promise<void> }> {
   const deps = createSaltRuntimeDeps(api);
+  runtimeRef.current = deps;
 
   // Setup step: put this agent into socket mode. Best-effort -- a repeat
-  // call is idempotent server-side, and a failure here (e.g. the socket
-  // lane's PATCH route not deployed yet) should not stop the plugin from
-  // loading; it's logged and the poller is started regardless, so a race
-  // against that rollout self-heals on the operator's next restart.
+  // call is idempotent server-side, and a failure here should not stop the
+  // plugin from loading; it's logged and the socket connection starts
+  // regardless.
   try {
-    await setDeliveryMode(deps.restOptions, "socket");
+    await deps.client.setDeliveryMode(deps.account.apiKey, "socket");
   } catch (err) {
     deps.logger?.error(`[salt] setDeliveryMode(socket) failed (continuing anyway): ${(err as Error).message}`);
   }
 
   const stateDir = api.runtime.state.resolveStateDir(process.env);
   const cursorDir = resolveSaltCursorDir(stateDir);
-  const cursorStore = createFileCursorStore(cursorDir);
+  const identities = createSingleIdentityStore(deps.identity);
 
-  const onUpdate = createUpdateHandler(deps, api);
+  // The Salt socket connection itself: a real Action Cable websocket held
+  // open for the life of this process (salt-agent-sdk's
+  // `createSocketClient`). No timer of its own -- salt-api pushes each
+  // envelope the instant it's written; an idle, caught-up agent makes
+  // zero requests. This is the entire replacement for the old
+  // socket-poller.ts long-poll loop.
+  const socket: SocketClient = createSocketClient({
+    host: deps.account.host,
+    apiKey: deps.account.apiKey,
+    agentId: deps.account.agentId,
+    client: deps.client,
+    identities,
+    pgpPassphrase: deps.account.passphrase,
+    verifySignatures: deps.account.verifySignatures,
+    limit: deps.account.pollLimit,
+    // Rooted in OpenClaw's own plugin state dir, same property the old
+    // hand-rolled cursor file had: a restart resumes where it left off
+    // instead of replaying Salt's retained outbox.
+    cursorStore: FileCursorStore(cursorDir),
+    dedupeStore: FileDedupeStore(cursorDir),
+    logger: deps.logger,
+    onMessage: createMessageHandler(deps),
+    onChatOpened: createChatOpenedHandler(deps),
+  });
+  socket.start();
 
-  const handle = createSocketPoller(
-    {
-      fetchUpdates: (after, timeoutSeconds, limit) =>
-        fetchAgentUpdates(deps.restOptions, { after, timeoutSeconds, limit }),
-      getSigningSecret: () => deps.client.getWebhookSecret(deps.account.apiKey),
-      cursorStore,
-      onUpdate,
-      logger: deps.logger,
-      toleranceSeconds: 300,
-    },
-    {
-      timeoutSeconds: deps.account.pollTimeoutSeconds,
-      limit: deps.account.pollLimit,
-    },
-  );
+  if (deps.account.joinCommons) {
+    // Fire-and-forget at startup: never block plugin load on a Commons
+    // round trip. Failures are logged inside joinCommons itself.
+    void joinCommons(deps);
+  }
 
   const resolveCurrentChatId = (_context: unknown): string | undefined => {
     // SDK-INTEGRATION-GUESS: the real per-turn tool context's "current
@@ -298,23 +469,48 @@ export async function startSaltChannel(api: OpenClawPluginApi): Promise<{ stop: 
     { name: "salt_request_payment" },
   );
 
-  return { stop: () => handle.stop() };
+  return { stop: () => socket.stop() };
+}
+
+/**
+ * The shared `message` tool's outbound path (open rooms, plaintext out):
+ * branches on whether `params.to` is currently an open room
+ * (`rest.ts#isOpenRoom`, which fails closed -- an unreadable lookup is
+ * treated as "still encrypted" rather than risking a plaintext leak into a
+ * real E2E chat) and posts plain via `client.postPlainMessage` there, or
+ * PGP-encrypted via `createReplySender` (below) everywhere else. Kept as
+ * its own function, separate from the `outbound.attachedResults.sendText`
+ * closure above, so it's directly unit-testable with mock deps instead of
+ * requiring a full `startSaltChannel` (which opens a real socket).
+ */
+export async function sendChannelText(
+  deps: SaltRuntimeDeps,
+  params: { to: string; text: string },
+): Promise<{ messageId?: string; [key: string]: unknown }> {
+  const open = await isOpenRoom(deps.restOptions, params.to, deps.logger);
+  const posted = open
+    ? await deps.client.postPlainMessage(deps.account.apiKey, params.to, params.text)
+    : await createReplySender(deps)(params.to, params.text);
+  const id = (posted as { id?: string } | undefined)?.id;
+  return id ? { messageId: id } : {};
 }
 
 // Re-exported for outbound.ts callers wired directly against a running
 // SaltClient (kept here so index.ts has one place to build the full reply
-// path without re-deriving `encryptFor`/`sendEncryptedReply` wiring).
+// path without re-deriving `encryptFor`/`sendEncryptedReply` wiring), and
+// reused directly by `sendChannelText` above for the encrypted-chat
+// branch.
 export function createReplySender(deps: SaltRuntimeDeps) {
   return (chatId: string, text: string, mentions?: string[]) =>
     sendEncryptedReply(
       {
         encryptFor,
         getChatMembers: async (id) => {
-          const members = await deps.client.getChatMembers(deps.account.apiKey, id);
+          const members = await deps.client.getChatMembers(deps.account.apiKey, id as SaltId);
           return members.map((m) => ({ id: String(m.id), publicKey: m.public_key }));
         },
         postMessage: (id, message, senderMessage, mentionIds) =>
-          deps.client.postMessage(deps.account.apiKey, id, message, senderMessage, undefined, mentionIds),
+          deps.client.postMessage(deps.account.apiKey, id as SaltId, message, senderMessage, undefined, mentionIds as SaltId[] | undefined),
         logger: deps.logger,
       },
       { chatId, text, selfAgentId: deps.account.agentId, selfPublicKey: deps.account.publicKey, mentions },

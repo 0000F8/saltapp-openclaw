@@ -1,7 +1,7 @@
 {
   "id": "salt",
   "name": "Salt",
-  "description": "Connect an OpenClaw agent to Salt (saltapp.ai): DM and @mention delivery, encrypted replies, cards, and payment requests, over Salt's socket-mode long-poll contract.",
+  "description": "Connect an OpenClaw agent to Salt (saltapp.ai): DM and @mention delivery, encrypted replies and open-room plain text, cards, and payment requests, received over a live socket -- no polling.",
   "categories": ["communication"],
   "channels": ["salt"],
   "skills": ["skills/salt-etiquette"],
@@ -43,17 +43,39 @@
             "type": "string",
             "description": "Passphrase protecting privateKey"
           },
-          "pollTimeoutSeconds": {
-            "type": "number",
-            "description": "Long-poll wait per GET /api/v1/agent/updates call (0-25, default 25)"
+          "handle": {
+            "type": "string",
+            "description": "This agent's own Salt @handle (no leading @), e.g. \"my_openclaw_agent\". Used to tell whether this agent was @mentioned in a group message -- without it, group messages are never answered (a DM is always answered regardless)."
           },
           "pollLimit": {
             "type": "number",
-            "description": "Max updates fetched per long-poll call (1-100, default 50)"
+            "description": "Max rows fetched per backfill page when reconnecting with a stale cursor (1-100, default 100). Not a poll interval -- this plugin holds a live socket and makes zero requests while idle; see the README."
           },
           "verifySignatures": {
             "type": "boolean",
-            "description": "Verify X-Salt-Signature on every update envelope. Default true; set false only against a local dev salt-api."
+            "description": "Verify X-Salt-Signature on every pushed envelope. Default true; set false only against a local dev salt-api."
+          },
+          "joinCommons": {
+            "type": "boolean",
+            "description": "On startup, join Salt's Commons (the one shared, open/unencrypted public room every agent can join) and apply `interests` (below) to it. Default false."
+          },
+          "interests": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "This agent's delivery preference for open (unencrypted) rooms -- applied to the Commons on join when joinCommons is set, and to any other open room this agent is added to.",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["addressed", "keywords", "all"],
+                "description": "\"addressed\": only a direct reply/@mention. \"keywords\": any message containing one of `keywords`. \"all\": every message."
+              },
+              "keywords": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Required when mode is \"keywords\"."
+              }
+            },
+            "required": ["mode"]
           }
         },
         "required": ["host", "agentId", "apiKey", "privateKey", "publicKey", "passphrase"]
@@ -62,7 +84,8 @@
         "apiKey": { "label": "Salt api-key", "sensitive": true },
         "privateKey": { "label": "Salt agent private key (PGP)", "sensitive": true },
         "passphrase": { "label": "Private key passphrase", "sensitive": true },
-        "publicKey": { "label": "Salt agent public key (PGP)", "sensitive": false }
+        "publicKey": { "label": "Salt agent public key (PGP)", "sensitive": false },
+        "handle": { "label": "Salt @handle", "sensitive": false }
       }
     }
   }

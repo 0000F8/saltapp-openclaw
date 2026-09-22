@@ -4,18 +4,18 @@
 //
 // registerCliMetadata runs even during a metadata-only load (root `--help`
 // etc.) without pulling in the channel runtime; registerFull is where the
-// socket-mode bridge and the two Salt tools actually start, and only runs
-// on a full load.
+// Salt socket connection and the two Salt tools actually start, and only
+// runs on a full load.
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { saltChannelPlugin, startSaltChannel } from "./src/channel.js";
 
-let stopChannel: (() => void) | undefined;
+let stopChannel: (() => Promise<void>) | undefined;
 
 export default defineChannelPluginEntry({
   id: "salt",
   name: "Salt",
-  description: "Connect an OpenClaw agent to Salt (saltapp.ai) over its socket-mode long-poll contract.",
+  description: "Connect an OpenClaw agent to Salt (saltapp.ai) over a live socket -- no polling.",
   plugin: saltChannelPlugin,
   registerCliMetadata(api) {
     api.registerCli?.(
@@ -37,6 +37,6 @@ export default defineChannelPluginEntry({
 // part of the documented ChannelPlugin/entry contract (SDK-INTEGRATION-GUESS
 // -- there is no documented plugin-unload hook this was verified against;
 // see HANDOFF.md).
-export function stopSaltChannelForTesting(): void {
-  stopChannel?.();
+export async function stopSaltChannelForTesting(): Promise<void> {
+  await stopChannel?.();
 }
