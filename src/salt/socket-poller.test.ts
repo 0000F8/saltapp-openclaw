@@ -36,7 +36,10 @@ describe("pollOnce", () => {
 
     const result = await pollOnce({
       fetchUpdates: async (after) => {
-        expect(after).toBe("0");
+        // Round-4 socket contract (LANES.md K2): a fresh/never-written
+        // cursor omits `after` entirely rather than sending "0", so
+        // salt-api's own server-side ack applies.
+        expect(after).toBeUndefined();
         return { updates: [row], cursor: "5" };
       },
       getSigningSecret: async () => SECRET,
@@ -132,7 +135,7 @@ describe("pollOnce", () => {
 
     await pollOnce({ fetchUpdates, getSigningSecret: async () => SECRET, cursorStore, onUpdate: vi.fn() });
 
-    expect(fetchUpdates).toHaveBeenCalledWith("99", 25, 50);
+    expect(fetchUpdates).toHaveBeenCalledWith("99", 2, 50);
   });
 
   it("persists the cursor across cycles via a real file-backed cursor store", async () => {
@@ -147,7 +150,7 @@ describe("pollOnce", () => {
 
       await pollOnce({
         fetchUpdates: async (after) => {
-          expect(after).toBe("0");
+          expect(after).toBeUndefined();
           return { updates: [rowA], cursor: "10" };
         },
         getSigningSecret: async () => SECRET,
@@ -218,5 +221,32 @@ describe("createSocketPoller", () => {
     expect(sleepDelays[0]).toBe(100);
     expect(sleepDelays[1]).toBe(200);
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("network down"));
+  });
+
+  it("ramps the idle delay up toward idleDelayMs across consecutive empty polls, then snaps back to activeDelayMs on activity", async () => {
+    const cursorStore = memoryCursorStore();
+    const row = signed(1, JSON.stringify({ message: { chat_id: "1" } }));
+    // Cycle 1: empty. Cycle 2: empty. Cycle 3: one row (activity). Cycle 4: empty again. Then stop.
+    let cycle = 0;
+    const fetchUpdates = vi.fn().mockImplementation(async () => {
+      cycle += 1;
+      if (cycle === 3) return { updates: [row], cursor: "1" };
+      return { updates: [], cursor: cycle > 3 ? "1" : "0" };
+    });
+    const sleepDelays: number[] = [];
+    const sleep = vi.fn().mockImplementation(async (ms: number) => {
+      sleepDelays.push(ms);
+      if (sleepDelays.length >= 4) handle.stop();
+    });
+
+    const handle = createSocketPoller(
+      { fetchUpdates, getSigningSecret: async () => SECRET, cursorStore, onUpdate: vi.fn() },
+      { sleep, activeDelayMs: 10, idleDelayMs: 25 },
+    );
+
+    await handle.done;
+
+    // idle, idle (ramping toward the 25ms ceiling in 10ms steps) -> activity (snaps back to 10ms) -> idle again (ramps back up).
+    expect(sleepDelays).toEqual([20, 25, 10, 20]);
   });
 });

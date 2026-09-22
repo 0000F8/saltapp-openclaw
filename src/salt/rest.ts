@@ -74,7 +74,12 @@ export interface SocketUpdateRow {
 }
 
 export interface FetchAgentUpdatesParams {
-  after: string;
+  /** Omit (or pass `undefined`) on a fresh start -- see socket-poller.ts's
+   *  `pollOnce`, which is the only caller and already resolves a fresh/lost
+   *  cursor to `undefined` rather than "0" (round-4 socket contract,
+   *  LANES.md K2: an omitted `after` lets salt-api's own server-side ack
+   *  apply instead of replaying up to 7 days of retained outbox). */
+  after?: string;
   timeoutSeconds?: number;
   limit?: number;
 }
@@ -84,14 +89,16 @@ export interface FetchAgentUpdatesResult {
   cursor: string;
 }
 
-/** `GET /api/v1/agent/updates?after=&timeout=&limit=` -- the long-poll
- *  contract. `timeoutSeconds` is clamped 0-25, `limit` 1-100 (server-side;
- *  this helper does not re-validate, it just forwards). */
+/** `GET /api/v1/agent/updates?after=&timeout=&limit=` -- the socket-mode
+ *  short-poll contract. `timeoutSeconds` is clamped server-side to 0-2s
+ *  (round 3/4 revision -- it was a real long-poll clamped 0-25 before H1),
+ *  `limit` 1-100; this helper does not re-validate, it just forwards. */
 export async function fetchAgentUpdates(
   options: SaltRestOptions,
   params: FetchAgentUpdatesParams,
 ): Promise<FetchAgentUpdatesResult> {
-  const query = new URLSearchParams({ after: params.after });
+  const query = new URLSearchParams();
+  if (params.after !== undefined) query.set("after", params.after);
   if (params.timeoutSeconds !== undefined) query.set("timeout", String(params.timeoutSeconds));
   if (params.limit !== undefined) query.set("limit", String(params.limit));
   return saltRequest(options, "GET", `/api/v1/agent/updates?${query.toString()}`);

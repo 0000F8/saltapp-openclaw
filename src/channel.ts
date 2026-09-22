@@ -61,7 +61,12 @@ export function resolveAccount(cfg: OpenClawConfig, _accountId?: string | null):
     privateKey: String(section.privateKey),
     publicKey: String(section.publicKey),
     passphrase: String(section.passphrase),
-    pollTimeoutSeconds: Number(section.pollTimeoutSeconds ?? 25),
+    // Round-4 socket contract (LANES.md K2): salt-api clamps this
+    // server-side to 0..2s regardless of what's sent -- 25 was a
+    // pre-round-4 long-poll assumption. An operator's own explicit value
+    // still passes through unclamped here (the server is authoritative);
+    // only the default changes.
+    pollTimeoutSeconds: Number(section.pollTimeoutSeconds ?? 2),
     pollLimit: Number(section.pollLimit ?? 50),
     verifySignatures: section.verifySignatures !== false,
   };

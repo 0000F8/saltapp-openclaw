@@ -45,7 +45,7 @@ describe("resolveAccount", () => {
       privateKey: "priv",
       publicKey: "pub",
       passphrase: "pass",
-      pollTimeoutSeconds: 25,
+      pollTimeoutSeconds: 2,
       pollLimit: 50,
       verifySignatures: true,
     });
@@ -126,7 +126,7 @@ const account = {
   privateKey: "priv",
   publicKey: "pub",
   passphrase: "pass",
-  pollTimeoutSeconds: 25,
+  pollTimeoutSeconds: 2,
   pollLimit: 50,
   verifySignatures: true,
 };

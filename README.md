@@ -7,14 +7,17 @@ interactive cards and payment requests.
 
 Salt agents normally receive messages over a webhook to a public URL.
 OpenClaw usually runs on a laptop with no public URL, so this plugin instead
-uses **socket mode**: a long-poll loop against
-`GET /api/v1/agent/updates` that receives exactly what a webhook would have
-delivered, over a connection this machine initiates outbound. No inbound port,
-no tunnel, no public endpoint.
+uses **socket mode**: an adaptively-paced short-poll loop against
+`GET /api/v1/agent/updates` (about once a second right after activity,
+backing off to about once every five seconds while idle) that receives
+exactly what a webhook would have delivered, over a connection this machine
+initiates outbound. No inbound port, no tunnel, no public endpoint. The poll
+cursor persists to OpenClaw's plugin state dir, so a restart resumes where
+it left off instead of replaying Salt's retained outbox.
 
 ## What it does
 
-- **Inbound**: long-polls Salt for new updates, verifies each envelope's
+- **Inbound**: short-polls Salt for new updates, verifies each envelope's
   HMAC signature, decrypts the PGP ciphertext, and maps the result into a
   DM-or-group / sender / mentions shape for OpenClaw's agent turn pipeline.
 - **Outbound**: encrypts a reply for every current member of the chat (Salt
@@ -85,7 +88,12 @@ openclaw plugins install ./saltapp-openclaw
 
 1. **Register the agent on Salt** (needs a human Salt account and its
    api-key from Account -> API keys). The quickest way is
-   [`salt-agent-sdk`](https://github.com/0000F8/salt-agent-sdk):
+   [`salt-agent-sdk`](https://github.com/0000F8/salt-agent-sdk). Generate the
+   keypair locally and register only the PUBLIC half -- as of Salt's 0.73.0
+   custody change, salt-api never accepts a private key on agent creation
+   (that's the legacy `server` scheme, forbidden for new agent rows); the
+   private key stays on this machine the whole time, matching the
+   **Custody** section below:
 
    ```js
    const { generateKeypair, createSaltClient } = require("salt-agent-sdk");
@@ -96,12 +104,14 @@ openclaw plugins install ./saltapp-openclaw
      username: "my_openclaw_agent",
      display_name: "My OpenClaw Agent",
      public_key: keys.publicKey,
-     private_key: keys.privateKey,
      public_fingerprint: keys.fingerprint,
      // no `webhook` -- this agent will run in socket mode
+     // no `private_key` -- salt-api never receives it (key scheme "external")
    });
    // Capture agent.id and agent.api_key NOW -- salt-api never shows the
-   // raw api key again after this call.
+   // raw api key again after this call. keys.privateKey and keys.passphrase
+   // never leave this machine -- paste them into step 2's config, not into
+   // any Salt API call.
    ```
 
 2. **Configure the channel** in your OpenClaw config

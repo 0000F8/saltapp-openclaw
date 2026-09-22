@@ -1,5 +1,34 @@
 # HANDOFF.md
 
+## 2026-09-22 alignment pass (salt-agent-sdk 0.8, round-4 socket contract)
+
+- `SALT_POLL_TIMEOUT_SECONDS` default (and `channel.ts`'s `pollTimeoutSeconds`
+  default) dropped from 25 to 2 -- salt-api's `GET /api/v1/agent/updates`
+  clamps `timeout` server-side to 0..2s now (H1's short-poll revision); 25
+  was a pre-round-4 long-poll assumption.
+- `socket-poller.ts`'s `pollOnce` now omits the `after` query param entirely
+  on a fresh/lost cursor (was sending `after=0`), so salt-api's own
+  server-side ack (`users.agent_updates_acked_id`) applies instead.
+- `createSocketPoller`'s run loop is now adaptively paced
+  (`activeDelayMs`/`idleDelayMs`, defaulting to salt-agent-sdk's own
+  `ACTIVE_POLL_DELAY_MS`/`IDLE_POLL_DELAY_MS`, ~1s/~5s) instead of relying
+  on the old 25s long-poll itself to provide pacing.
+- Fixed README's agent-registration example: it was passing `private_key`
+  to `client.createAgent`, which salt-api has rejected for new agents since
+  the 0.73.0 custody change (the SDK's `CreateAgentParams` type doesn't even
+  have that field anymore). Registration now sends only `public_key`/
+  `public_fingerprint`; the private key stays local, matching the Custody
+  section's own (already-correct) description of this plugin's trust model.
+- `salt-agent-sdk` dependency bumped to `^0.8.0`.
+- Left alone: signature verification stays local (`envelope.ts`) -- the SDK
+  still has no standalone verifier export, only `createDispatcher`'s
+  Express-shaped one (see its own header comment). `addReaction` stays
+  local too -- `SaltClient` still has no `react`/`unreact`/`deleteMessage`
+  method as of 0.8.0.
+- 76 tests passing (was 74), `tsc -p tsconfig.json` clean.
+
+---
+
 Lane `openclaw` (design-fleet/runs/2026-09-17-distribution). Built against
 the "Socket mode contract" in that run's `LANES.md`, which a sibling lane
 (`socket`) is implementing in salt-api in parallel. As of this handoff, the

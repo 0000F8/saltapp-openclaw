@@ -47,6 +47,15 @@ describe("fetchAgentUpdates", () => {
     expect(result.updates).toHaveLength(1);
   });
 
+  it("omits `after` entirely when not provided -- round-4 contract: a fresh/lost cursor lets salt-api's own server-side ack apply", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ updates: [], cursor: "0" }));
+    await fetchAgentUpdates({ host: "https://saltapp.ai", apiKey: "key-1", fetchImpl }, { timeoutSeconds: 2, limit: 50 });
+
+    const [url] = fetchImpl.mock.calls[0] as [string];
+    expect(url).toBe("https://saltapp.ai/api/v1/agent/updates?timeout=2&limit=50");
+    expect(url).not.toContain("after=");
+  });
+
   it("strips a trailing slash from host before building the URL", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ updates: [], cursor: "0" }));
     await fetchAgentUpdates(

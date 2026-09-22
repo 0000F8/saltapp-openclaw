@@ -12,6 +12,7 @@
 // shape via inbound-mapper.ts, dispatch). This module only owns: fetch,
 // verify, parse JSON, advance cursor, loop with backoff.
 
+import { ACTIVE_POLL_DELAY_MS, IDLE_POLL_DELAY_MS } from "salt-agent-sdk";
 import type { CursorStore } from "./cursor-store.js";
 import { verifySocketEnvelope, type SocketEnvelopeHeaders } from "./envelope.js";
 
@@ -41,8 +42,14 @@ export interface Logger {
 }
 
 export interface SocketPollerDeps {
+  /** `after` is `undefined` when this identity has no real local cursor
+   *  yet (a fresh start, or a lost/never-written cursor file) -- round-4
+   *  socket contract (LANES.md K2): omit the param entirely rather than
+   *  sending `after=0`, so salt-api's own server-side ack
+   *  (`users.agent_updates_acked_id`) applies instead of replaying up to
+   *  7 days of retained outbox. */
   fetchUpdates(
-    after: string,
+    after: string | undefined,
     timeoutSeconds: number,
     limit: number,
   ): Promise<{ updates: SocketUpdateRow[]; cursor: string }>;
@@ -68,14 +75,24 @@ export interface PollOnceResult {
   cursor: string;
 }
 
-const DEFAULT_TIMEOUT_SECONDS = 25;
+// Round-4 socket contract (LANES.md K2, revised 2026-09-18, H1): salt-api
+// clamps `timeout` server-side to 0..2s -- a real long-poll parks a whole
+// Puma thread, and production runs few enough of them that a handful of
+// concurrently-polling agents would starve ordinary traffic. Sending a
+// higher value isn't rejected, just wasted on the wire.
+const DEFAULT_TIMEOUT_SECONDS = 2;
 const DEFAULT_LIMIT = 50;
 
 /** One fetch-verify-dispatch-advance cycle. Exposed standalone so tests
  *  (and a caller wanting manual control, e.g. a CLI `salt poll-once`
  *  command) don't need the retry/backoff loop below. */
 export async function pollOnce(deps: SocketPollerDeps, options: PollOnceOptions = {}): Promise<PollOnceResult> {
-  const after = (await deps.cursorStore.read()) ?? "0";
+  const persisted = await deps.cursorStore.read();
+  // "0" (this store's own not-yet-written sentinel -- see cursor-store.ts)
+  // and null/undefined both mean "no real cursor yet": omit `after`
+  // entirely so salt-api's server-side ack applies (see SocketPollerDeps'
+  // own doc comment above) rather than sending `after=0`.
+  const after = persisted && persisted !== "0" ? persisted : undefined;
   const secret = await deps.getSigningSecret();
   const { updates, cursor } = await deps.fetchUpdates(
     after,
@@ -132,9 +149,18 @@ export interface RunLoopOptions extends PollOnceOptions {
   /** Injectable sleep, for tests and for a caller that wants a custom
    *  scheduler instead of a bare setTimeout loop. */
   sleep?: (ms: number) => Promise<void>;
-  /** Delay between successful poll cycles when the server answered with
-   *  zero updates and no error -- normally 0, since the long-poll itself
-   *  already waited up to `timeoutSeconds`. */
+  /** Delay after a poll cycle that found real activity (>=1 row) --
+   *  poll again soon. Defaults to salt-agent-sdk's ACTIVE_POLL_DELAY_MS
+   *  (1s), so a fleet mixing this plugin with native salt-agent-sdk hosts
+   *  polls at one shared cadence. */
+  activeDelayMs?: number;
+  /** Ceiling an idle poll cycle (zero updates, no error) backs off toward,
+   *  one `activeDelayMs` step at a time, snapping back to `activeDelayMs`
+   *  the instant a cycle finds something again -- round-4 socket contract
+   *  (LANES.md K2): salt-api's short-poll only ever blocks up to ~2s now
+   *  (was a real 25s long-poll), so without this an idle agent would hit
+   *  the endpoint that often forever. Defaults to salt-agent-sdk's
+   *  IDLE_POLL_DELAY_MS (5s). */
   idleDelayMs?: number;
   /** Backoff after a fetch-level error (network, non-2xx, etc. -- NOT a
    *  single row's signature failure, which is already handled and never
@@ -162,17 +188,28 @@ export function createSocketPoller(deps: SocketPollerDeps, options: RunLoopOptio
   let stopped = false;
   let errorBackoffMs = options.errorBackoffMs ?? 1_000;
   const maxErrorBackoffMs = options.maxErrorBackoffMs ?? 30_000;
+  const activeDelayMs = options.activeDelayMs ?? ACTIVE_POLL_DELAY_MS;
+  const maxIdleDelayMs = options.idleDelayMs ?? IDLE_POLL_DELAY_MS;
+  let currentDelayMs = activeDelayMs;
 
   const done = (async () => {
     while (!stopped) {
       try {
-        await pollOnce(deps, options);
+        const result = await pollOnce(deps, options);
         errorBackoffMs = options.errorBackoffMs ?? 1_000; // reset on a clean cycle
-        if (options.idleDelayMs) await sleep(options.idleDelayMs);
+        // Adaptive pacing (round-4 socket contract, LANES.md K2): poll
+        // again soon right after real activity; back off one step at a
+        // time toward maxIdleDelayMs the longer nothing shows up, and
+        // snap back to activeDelayMs the moment something does.
+        currentDelayMs = result.fetched > 0 ? activeDelayMs : Math.min(currentDelayMs + activeDelayMs, maxIdleDelayMs);
+        if (stopped) break;
+        await sleep(currentDelayMs);
       } catch (err) {
+        if (stopped) break; // an intentional stop mid-request surfaces here too -- not a real failure
         deps.logger?.error(`[salt-socket] poll cycle failed: ${(err as Error).message}; backing off ${errorBackoffMs}ms`);
         await sleep(errorBackoffMs);
         errorBackoffMs = Math.min(errorBackoffMs * 2, maxErrorBackoffMs);
+        currentDelayMs = activeDelayMs; // resume at the active cadence once traffic is flowing again
       }
     }
   })();
