@@ -1,14 +1,28 @@
 import { describe, expect, it, vi } from "vitest";
 import { runChannelInboundEvent } from "openclaw/plugin-sdk/channel-inbound";
-import { createUpdateHandler, inspectAccount, resolveAccount, saltChannelPlugin } from "./channel.js";
-import type { VerifiedUpdate } from "./salt/socket-poller.js";
+import {
+  createChatOpenedHandler,
+  createMessageHandler,
+  inspectAccount,
+  resolveAccount,
+  saltChannelPlugin,
+  sendChannelText,
+} from "./channel.js";
+import type { MessageContext, ChatOpenedContext } from "salt-agent-sdk";
 
 // `openclaw` is not resolvable in this standalone repo (see
 // src/types/openclaw-plugin-sdk.d.ts's header comment), so both subpaths
 // channel.ts imports at the VALUE level (not `import type`) are mocked
 // with minimal stand-ins matching this plugin's own ambient types --
 // good enough to exercise this plugin's own logic, not a substitute for
-// running inside a real OpenClaw host. See HANDOFF.md.
+// running inside a real OpenClaw host. `salt-agent-sdk` itself is left
+// mostly real (createSaltClient, sameId, FileCursorStore/FileDedupeStore
+// are plain, side-effect-free exports, and none of these tests invoke
+// startSaltChannel, which is the only thing that opens a real socket) --
+// only `encryptFor` is stubbed, the same way outbound.test.ts stubs it,
+// since createReplySender (used by sendChannelText's encrypted branch)
+// imports it directly rather than accepting it injected, and the fake
+// public keys these tests use aren't valid PGP armor. See HANDOFF.md.
 vi.mock("openclaw/plugin-sdk/channel-core", () => ({
   createChannelPluginBase: (base: unknown) => base,
   createChatChannelPlugin: (opts: any) => ({
@@ -21,6 +35,13 @@ vi.mock("openclaw/plugin-sdk/channel-core", () => ({
 vi.mock("openclaw/plugin-sdk/channel-inbound", () => ({
   runChannelInboundEvent: vi.fn().mockResolvedValue(undefined),
 }));
+vi.mock("salt-agent-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("salt-agent-sdk")>();
+  return {
+    ...actual,
+    encryptFor: vi.fn(async (_plaintext: string, keys: string[]) => `cipher(${keys.join(",")})`),
+  };
+});
 
 const FULL_CONFIG = {
   channels: {
@@ -36,7 +57,7 @@ const FULL_CONFIG = {
 } as any;
 
 describe("resolveAccount", () => {
-  it("resolves every field from channels.salt", () => {
+  it("resolves every field from channels.salt, with defaults for the optional ones", () => {
     const account = resolveAccount(FULL_CONFIG);
     expect(account).toMatchObject({
       host: "https://saltapp.ai",
@@ -45,9 +66,11 @@ describe("resolveAccount", () => {
       privateKey: "priv",
       publicKey: "pub",
       passphrase: "pass",
-      pollTimeoutSeconds: 2,
-      pollLimit: 50,
+      handle: undefined,
+      pollLimit: 100,
       verifySignatures: true,
+      joinCommons: false,
+      interests: undefined,
     });
   });
 
@@ -56,14 +79,25 @@ describe("resolveAccount", () => {
     expect(() => resolveAccount(cfg)).toThrow(/agentId is required/);
   });
 
-  it("respects explicit poll tuning and verifySignatures: false", () => {
+  it("resolves handle, pollLimit, verifySignatures, joinCommons, and interests when set", () => {
     const cfg = {
-      channels: { salt: { ...FULL_CONFIG.channels.salt, pollTimeoutSeconds: 10, pollLimit: 5, verifySignatures: false } },
+      channels: {
+        salt: {
+          ...FULL_CONFIG.channels.salt,
+          handle: "salt_bot",
+          pollLimit: 25,
+          verifySignatures: false,
+          joinCommons: true,
+          interests: { mode: "keywords", keywords: ["help", "urgent"] },
+        },
+      },
     } as any;
     const account = resolveAccount(cfg);
-    expect(account.pollTimeoutSeconds).toBe(10);
-    expect(account.pollLimit).toBe(5);
+    expect(account.handle).toBe("salt_bot");
+    expect(account.pollLimit).toBe(25);
     expect(account.verifySignatures).toBe(false);
+    expect(account.joinCommons).toBe(true);
+    expect(account.interests).toEqual({ mode: "keywords", keywords: ["help", "urgent"] });
   });
 });
 
@@ -102,6 +136,7 @@ describe("saltChannelPlugin", () => {
     expect(typeof saltChannelPlugin.config.resolveAccount).toBe("function");
     expect(typeof saltChannelPlugin.config.inspectAccount).toBe("function");
     expect(typeof saltChannelPlugin.setup.applyAccountConfig).toBe("function");
+    expect(typeof (saltChannelPlugin as any).outbound.attachedResults.sendText).toBe("function");
   });
 
   it("applyAccountConfig merges input into channels.salt without dropping other channels", () => {
@@ -113,11 +148,12 @@ describe("saltChannelPlugin", () => {
     expect(next.channels.telegram).toEqual({ token: "t" });
     expect(next.channels.salt).toEqual({ host: "https://saltapp.ai", apiKey: "key-1" });
   });
-});
 
-function makeUpdate(body: unknown, event = "message"): VerifiedUpdate {
-  return { id: "1", event, body, rawBody: JSON.stringify(body), createdAt: "2026-09-18T00:00:00Z" };
-}
+  it("sendText refuses before the channel has started", async () => {
+    const sendText = (saltChannelPlugin as any).outbound.attachedResults.sendText;
+    await expect(sendText({ to: "chat-1", text: "hi" })).rejects.toThrow(/before the channel finished starting/);
+  });
+});
 
 const account = {
   host: "https://saltapp.ai",
@@ -126,74 +162,71 @@ const account = {
   privateKey: "priv",
   publicKey: "pub",
   passphrase: "pass",
-  pollTimeoutSeconds: 2,
-  pollLimit: 50,
+  handle: "salt_bot",
+  pollLimit: 100,
   verifySignatures: true,
+  joinCommons: false,
+  interests: undefined,
 };
 
-function makeDeps(members: Array<{ id: string; account_type?: string }>) {
+function makeDeps(members: Array<{ id: string; account_type?: string; public_key?: string }>) {
   const client = {
     getChatMembers: vi.fn().mockResolvedValue(members),
     signalTyping: vi.fn().mockResolvedValue(undefined),
+    setChatSubscription: vi.fn().mockResolvedValue(undefined),
+    postPlainMessage: vi.fn().mockResolvedValue({ id: "plain-1" }),
+    postMessage: vi.fn().mockResolvedValue({ id: "cipher-1" }),
   };
   return {
     client: client as any,
     restOptions: { host: account.host, apiKey: account.apiKey },
+    identity: { saltAppId: account.agentId, username: account.handle, apiKey: account.apiKey, publicKey: account.publicKey, privateKey: account.privateKey },
     account,
     logger: { info: vi.fn(), error: vi.fn() },
-    decrypt: vi.fn().mockResolvedValue("decrypted plaintext"),
   };
+}
+
+function makeCtx(overrides: Partial<MessageContext> & { chatId: string; senderId: string; text: string }): MessageContext {
+  return {
+    identity: undefined,
+    chatId: overrides.chatId,
+    senderId: overrides.senderId,
+    sender: { id: overrides.senderId, account_type: "User" },
+    text: overrides.text,
+    encrypted: true,
+    delegationDepth: 0,
+    chatMeta: undefined,
+    roomId: overrides.chatId,
+    session: undefined,
+    reply: vi.fn(),
+    ask: vi.fn(),
+    approve: vi.fn(),
+    ...overrides,
+  } as unknown as MessageContext;
 }
 
 const runChannelInboundEventMock = runChannelInboundEvent as unknown as ReturnType<typeof vi.fn>;
 
-describe("createUpdateHandler", () => {
-  it("ignores non-message events without decrypting or dispatching", async () => {
-    const deps = makeDeps([{ id: "agent-self" }, { id: "human-1" }]);
-    runChannelInboundEventMock.mockClear();
-    const handler = createUpdateHandler(deps as any, {} as any);
-
-    await handler(makeUpdate({}, "card_interaction"));
-
-    expect(deps.logger.info).toHaveBeenCalledWith(expect.stringContaining("card_interaction"));
-    expect(deps.decrypt).not.toHaveBeenCalled();
-    expect(runChannelInboundEventMock).not.toHaveBeenCalled();
-  });
-
-  it("ignores a group message that does not mention this agent, before signalling typing or dispatching", async () => {
+describe("createMessageHandler", () => {
+  it("ignores a group message that does not mention this agent's handle, before signalling typing or dispatching", async () => {
     const deps = makeDeps([{ id: "agent-self" }, { id: "human-1" }, { id: "human-2" }]);
     runChannelInboundEventMock.mockClear();
-    const handler = createUpdateHandler(deps as any, {} as any);
-    const body = {
-      message: {
-        chat_id: "chat-1",
-        message: "-----BEGIN PGP MESSAGE-----",
-        user: { id: "human-1", account_type: "User" },
-        mentions: [],
-      },
-    };
+    const handler = createMessageHandler(deps as any);
+    const ctx = makeCtx({ chatId: "chat-1", senderId: "human-1", text: "hey what's up" });
 
-    await handler(makeUpdate(body));
+    await handler(ctx);
 
-    expect(deps.decrypt).toHaveBeenCalled(); // decryption happens before gating
     expect(deps.client.signalTyping).not.toHaveBeenCalled();
     expect(runChannelInboundEventMock).not.toHaveBeenCalled();
   });
 
-  it("answers a group message that DOES mention this agent", async () => {
+  it("answers a group message that DOES mention this agent's handle", async () => {
     const deps = makeDeps([{ id: "agent-self" }, { id: "human-1" }, { id: "human-2" }]);
     runChannelInboundEventMock.mockClear();
-    const handler = createUpdateHandler(deps as any, {} as any);
-    const body = {
-      message: {
-        chat_id: "chat-1",
-        message: "-----BEGIN PGP MESSAGE-----",
-        user: { id: "human-1", account_type: "User" },
-        mentions: ["agent-self"],
-      },
-    };
+    const handler = createMessageHandler(deps as any);
+    const ctx = makeCtx({ chatId: "chat-1", senderId: "human-1", text: "hey @salt_bot can you help" });
 
-    await handler(makeUpdate(body));
+    await handler(ctx);
 
     expect(deps.client.signalTyping).toHaveBeenCalledWith(account.apiKey, "chat-1");
     expect(runChannelInboundEventMock).toHaveBeenCalledWith(
@@ -201,7 +234,7 @@ describe("createUpdateHandler", () => {
         channelId: "salt",
         chatId: "chat-1",
         senderId: "human-1",
-        text: "decrypted plaintext",
+        text: "hey @salt_bot can you help",
         isGroup: true,
         mentionsSelf: true,
       }),
@@ -211,50 +244,109 @@ describe("createUpdateHandler", () => {
   it("always answers a DM regardless of mentions", async () => {
     const deps = makeDeps([{ id: "agent-self" }, { id: "human-1" }]);
     runChannelInboundEventMock.mockClear();
-    const handler = createUpdateHandler(deps as any, {} as any);
-    const body = {
-      message: {
-        chat_id: "chat-1",
-        message: "-----BEGIN PGP MESSAGE-----",
-        user: { id: "human-1", account_type: "User" },
-        mentions: [],
-      },
-    };
+    const handler = createMessageHandler(deps as any);
+    const ctx = makeCtx({ chatId: "chat-1", senderId: "human-1", text: "no mention here" });
 
-    await handler(makeUpdate(body));
+    await handler(ctx);
 
     expect(runChannelInboundEventMock).toHaveBeenCalledWith(
       expect.objectContaining({ isGroup: false, mentionsSelf: false }),
     );
   });
 
-  it("ignores this agent's own echoed message (never replies to itself)", async () => {
-    const deps = makeDeps([{ id: "agent-self" }, { id: "human-1" }]);
+  it("never answers a group message when no handle is configured, and logs why (once)", async () => {
+    const deps = makeDeps([{ id: "agent-self" }, { id: "human-1" }, { id: "human-2" }]);
+    deps.account = { ...account, handle: undefined };
     runChannelInboundEventMock.mockClear();
-    const handler = createUpdateHandler(deps as any, {} as any);
-    const body = {
-      message: {
-        chat_id: "chat-1",
-        message: "-----BEGIN PGP MESSAGE-----",
-        user: { id: "agent-self", account_type: "Agent" },
-        mentions: [],
-      },
-    };
+    const handler = createMessageHandler(deps as any);
 
-    await handler(makeUpdate(body));
+    await handler(makeCtx({ chatId: "chat-1", senderId: "human-1", text: "@salt_bot hello" }));
+    await handler(makeCtx({ chatId: "chat-1", senderId: "human-1", text: "@salt_bot hello again" }));
 
-    expect(deps.client.signalTyping).not.toHaveBeenCalled();
     expect(runChannelInboundEventMock).not.toHaveBeenCalled();
+    expect(deps.logger.error).toHaveBeenCalledTimes(1); // warns once, not on every message
   });
 
-  it("ignores a row with no message ciphertext (e.g. a system-event-shaped body)", async () => {
+  it("exposes encrypted and deliveredBecause on the raw payload for an open-room delivery", async () => {
     const deps = makeDeps([{ id: "agent-self" }, { id: "human-1" }]);
     runChannelInboundEventMock.mockClear();
-    const handler = createUpdateHandler(deps as any, {} as any);
+    const handler = createMessageHandler(deps as any);
+    const ctx = makeCtx({
+      chatId: "chat-1",
+      senderId: "human-1",
+      text: "plain room text",
+      encrypted: false,
+      deliveredBecause: "keyword" as any,
+    });
 
-    await handler(makeUpdate({ message: { chat_id: "chat-1", event_type: "call_missed" } }));
+    await handler(ctx);
 
-    expect(deps.decrypt).not.toHaveBeenCalled();
-    expect(runChannelInboundEventMock).not.toHaveBeenCalled();
+    expect(runChannelInboundEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        raw: expect.objectContaining({ encrypted: false, deliveredBecause: "keyword" }),
+      }),
+    );
+  });
+});
+
+describe("createChatOpenedHandler", () => {
+  it("does nothing when no interests are configured", async () => {
+    const deps = makeDeps([]);
+    const handler = createChatOpenedHandler(deps as any);
+    await handler({ chatId: "chat-1", chat: { encrypted: false } } as unknown as ChatOpenedContext);
+    expect(deps.client.setChatSubscription).not.toHaveBeenCalled();
+  });
+
+  it("does nothing for an ordinary encrypted chat even with interests configured", async () => {
+    const deps = makeDeps([]);
+    deps.account = { ...account, interests: { mode: "all" } };
+    const handler = createChatOpenedHandler(deps as any);
+    await handler({ chatId: "chat-1", chat: {} } as unknown as ChatOpenedContext);
+    expect(deps.client.setChatSubscription).not.toHaveBeenCalled();
+  });
+
+  it("applies configured interests to a newly-opened open room", async () => {
+    const deps = makeDeps([]);
+    deps.account = { ...account, interests: { mode: "keywords", keywords: ["help"] } };
+    const handler = createChatOpenedHandler(deps as any);
+    await handler({ chatId: "chat-1", chat: { encrypted: false } } as unknown as ChatOpenedContext);
+    expect(deps.client.setChatSubscription).toHaveBeenCalledWith(account.apiKey, "chat-1", { mode: "keywords", keywords: ["help"] });
+  });
+});
+
+describe("sendChannelText", () => {
+  it("posts plain text into an open room without encrypting", async () => {
+    const deps = makeDeps([{ id: "agent-self", public_key: "pub-self" }, { id: "human-1", public_key: "pub-human-1" }]);
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: "chat-1", encrypted: false }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    deps.restOptions = { ...deps.restOptions, fetchImpl } as any;
+
+    const result = await sendChannelText(deps as any, { to: "chat-1", text: "hello room" });
+
+    expect(deps.client.postPlainMessage).toHaveBeenCalledWith(account.apiKey, "chat-1", "hello room");
+    expect(deps.client.postMessage).not.toHaveBeenCalled();
+    expect(result).toEqual({ messageId: "plain-1" });
+  });
+
+  it("encrypts for a chat that is not an open room", async () => {
+    const deps = makeDeps([{ id: "agent-self", public_key: "pub-self" }, { id: "human-1", public_key: "pub-human-1" }]);
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: "chat-1" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    deps.restOptions = { ...deps.restOptions, fetchImpl } as any;
+
+    const result = await sendChannelText(deps as any, { to: "chat-1", text: "hello room" });
+
+    expect(deps.client.postPlainMessage).not.toHaveBeenCalled();
+    expect(deps.client.postMessage).toHaveBeenCalled();
+    expect(result).toEqual({ messageId: "cipher-1" });
+  });
+
+  it("fails closed (encrypts) when the open-room lookup itself errors", async () => {
+    const deps = makeDeps([{ id: "agent-self", public_key: "pub-self" }, { id: "human-1", public_key: "pub-human-1" }]);
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }));
+    deps.restOptions = { ...deps.restOptions, fetchImpl } as any;
+
+    await sendChannelText(deps as any, { to: "chat-1", text: "hello room" });
+
+    expect(deps.client.postPlainMessage).not.toHaveBeenCalled();
+    expect(deps.client.postMessage).toHaveBeenCalled();
   });
 });

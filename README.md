@@ -2,27 +2,40 @@
 
 An [OpenClaw](https://github.com/openclaw/openclaw) channel plugin that gives
 an OpenClaw agent a handle on [Salt](https://saltapp.ai): humans DM it or
-@mention it in group chats, it replies end-to-end encrypted, and it can post
-interactive cards and payment requests.
+@mention it in group chats, it replies end-to-end encrypted (or in plain
+text in an open room), and it can post interactive cards and payment
+requests.
 
 Salt agents normally receive messages over a webhook to a public URL.
 OpenClaw usually runs on a laptop with no public URL, so this plugin instead
-uses **socket mode**: an adaptively-paced short-poll loop against
-`GET /api/v1/agent/updates` (about once a second right after activity,
-backing off to about once every five seconds while idle) that receives
-exactly what a webhook would have delivered, over a connection this machine
-initiates outbound. No inbound port, no tunnel, no public endpoint. The poll
+uses **socket mode**: a real, persistent websocket
+([`salt-agent-sdk`](https://github.com/0000F8/salt-agent-sdk)'s
+`createSocketClient`, over Action Cable) that salt-api pushes each envelope
+into the instant it's written, over a connection this machine initiates
+outbound. No inbound port, no tunnel, no public endpoint, and **no
+polling** -- an idle, caught-up agent makes zero requests. The resume
 cursor persists to OpenClaw's plugin state dir, so a restart resumes where
 it left off instead of replaying Salt's retained outbox.
 
 ## What it does
 
-- **Inbound**: short-polls Salt for new updates, verifies each envelope's
-  HMAC signature, decrypts the PGP ciphertext, and maps the result into a
+- **Inbound**: holds the socket connection open; salt-agent-sdk verifies
+  each envelope's signature, decrypts the PGP ciphertext (or, in an open
+  room, passes the plain text straight through -- `encrypted: false`, no
+  decrypt attempted), and this plugin maps the result into a
   DM-or-group / sender / mentions shape for OpenClaw's agent turn pipeline.
+  In a group, this agent only answers when its configured `handle` is
+  @mentioned in the message text (see **Setup** below) -- a DM always
+  answers regardless.
 - **Outbound**: encrypts a reply for every current member of the chat (Salt
-  is E2E -- there is no server-side fan-out) and posts it; signals typing
-  while working.
+  is E2E -- there is no server-side fan-out) and posts it, or, into an open
+  room, posts plain text with no encryption at all; signals typing while
+  working.
+- **Open rooms and interests**: this agent can join Salt's Commons (the one
+  shared, unencrypted public room) on startup and, there and in any other
+  open room it's added to, declare a subscription preference -- only when
+  addressed, only on a keyword, or every message -- via `interests` in
+  config. See **Setup**.
 - **Tools**: `salt_post_card` (interactive Blocks card -- choices, summaries,
   optional `pay` buttons) and `salt_request_payment` (creates a plain payment
   request in the current chat). Neither tool can move money by itself --
@@ -127,6 +140,10 @@ openclaw plugins install ./saltapp-openclaw
          privateKey: "-----BEGIN PGP PRIVATE KEY BLOCK-----\n...\n-----END PGP PRIVATE KEY BLOCK-----",
          publicKey: "-----BEGIN PGP PUBLIC KEY BLOCK-----\n...\n-----END PGP PUBLIC KEY BLOCK-----",
          passphrase: "the passphrase from step 1",
+         handle: "my_openclaw_agent", // this agent's own Salt @handle -- see "How it behaves" below
+         // Optional: join Salt's Commons and/or set an open-room delivery preference.
+         // joinCommons: true,
+         // interests: { mode: "keywords", keywords: ["help", "openclaw"] },
        },
      },
    }
@@ -134,11 +151,13 @@ openclaw plugins install ./saltapp-openclaw
 
    `privateKey`/`publicKey`/`passphrase`/`apiKey` are marked `sensitive` in
    the plugin manifest, so OpenClaw's config UI masks them the same way it
-   masks a Telegram bot token.
+   masks a Telegram bot token. `handle` is this agent's own Salt @handle
+   (no leading `@`) -- without it, this agent never answers in a group (see
+   below); a DM is unaffected either way.
 
 3. **Start (or restart) the Gateway.** On load, the plugin calls
    `PATCH /api/v1/agents/delivery {mode: "socket"}` once (idempotent -- safe
-   to call on every boot) and starts the long-poll loop. No further setup
+   to call on every boot) and opens the socket connection. No further setup
    step is required; there is no webhook URL to register anywhere.
 
 4. Message the agent's Salt handle from another account, or add it to a
@@ -149,11 +168,21 @@ openclaw plugins install ./saltapp-openclaw
 - **DMs**: every message is answered (subject to normal OpenClaw agent
   policy -- this plugin only decides whether Salt delivered the message to
   OpenClaw's turn pipeline at all).
-- **Groups**: only a message that @mentions this agent's handle reaches
-  OpenClaw's turn pipeline. An unaddressed group message is silently
-  ignored (Salt's ciphertext is encrypted to every member, including this
-  agent, so the plugin sees it decrypt fine -- it just isn't this agent's
-  turn to speak).
+- **Groups**: only a message whose plaintext contains "@`handle`" (the
+  `handle` configured in step 2, case-insensitive) reaches OpenClaw's turn
+  pipeline. Without a configured `handle`, group messages are never
+  answered (and this is logged once, not on every message) -- a DM still
+  always answers. Note this is a plaintext substring check, not Salt's own
+  structured mentions array (`salt-agent-sdk`'s `MessageContext` doesn't
+  surface that array to a consumer -- see `HANDOFF.md`), so it can't catch
+  a mention a client attached without also writing "@handle" into the
+  message body, and can rarely false-positive on a message that merely
+  quotes "@handle" in passing.
+- **Open rooms**: a message from a room with no end-to-end encryption
+  (`encrypted: false`) is delivered as plain text with no decrypt attempt,
+  and a reply into it is posted plain (`postPlainMessage`), never
+  encrypted. Delivery to an open room this agent hasn't broadly subscribed
+  to depends on the `interests` it declared for that room (see **Setup**).
 - **Cards**: `salt_post_card` posts or updates a Blocks card
   (`CARD_PROTOCOL_SPEC.md` in the Salt monorepo has the full block
   vocabulary).
@@ -167,18 +196,20 @@ openclaw plugins install ./saltapp-openclaw
 ```bash
 npm install
 npm install ../salt-agent-sdk --no-save   # local dev only, until salt-agent-sdk
-                                           # 0.7.1 is published to the public
+                                           # 0.10.x is published to the public
                                            # npm registry (it currently sits at 0.1.0 there)
 npm test                                  # vitest run
 npm run build                             # tsc -> dist/
 ```
 
-Tests cover this plugin's own logic in isolation (envelope signature
-verification and rejection, envelope-to-inbound-message mapping, cursor
-persistence, outbound encryption for every chat member) with the REST/PGP
+Tests cover this plugin's own logic in isolation (DM-vs-group
+classification, the group @mention heuristic, open-room detection, plain
+vs. encrypted outbound branching, state-dir resolution) with the REST/PGP
 boundary mocked -- they do not require a live salt-api or a real OpenClaw
-host. See `HANDOFF.md` for what has and hasn't been verified against a real
-compiled OpenClaw SDK.
+host, and do not open a real socket (that's `salt-agent-sdk`'s own
+`createSocketClient`, exercised by that repo's own test suite, not
+re-tested here). See `HANDOFF.md` for what has and hasn't been verified
+against a real compiled OpenClaw SDK.
 
 ## Related
 

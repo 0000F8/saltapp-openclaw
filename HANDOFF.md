@@ -1,5 +1,106 @@
 # HANDOFF.md
 
+## 2026-09-22, later: open rooms, interests, and no more polling (salt-agent-sdk 0.10.1)
+
+Owner rule, stated flat: "DO NOT USE POLLING as a mechanic EVER." Everything
+below is a response to that plus salt-api's open-rooms/interests contract
+(`encrypted: false` chats, plain text on the wire, `delivered_because` on a
+delivery, `PUT/DELETE /api/v1/chats/:id/subscription`).
+
+- **Receiving is now a real push connection, not a loop.** `src/salt/socket-poller.ts`
+  and `src/salt/envelope.ts` (this plugin's own hand-rolled short-poll loop
+  and HMAC envelope verifier) are both deleted. `channel.ts`'s
+  `startSaltChannel` now opens exactly one `salt-agent-sdk`
+  `createSocketClient` connection (a real Action Cable websocket) for the
+  life of the process; envelope verification, decrypt-or-pass-through,
+  identity resolution, cursor persistence and delivery-id dedupe are all
+  the SDK's job now (its own `FileCursorStore`/`FileDedupeStore`, rooted at
+  this plugin's existing OpenClaw-state-dir path via
+  `cursor-store.ts#resolveSaltCursorDir`, so a restart still resumes
+  instead of replaying the retained outbox). An idle, caught-up agent makes
+  zero requests -- confirmed with `grep -rniE "setinterval|while \("` over
+  `src/`: no hits outside comments/variable names.
+- **`inbound-mapper.ts` lost its raw-body mapper.** `mapMessageEventToInbound`
+  is gone (decrypt/routing is inside the SDK now, so there's no raw body
+  left to map here) -- `classifyChat` (DM vs group) is kept as-is. New:
+  `mentionsSelfByHandle(text, handle)`, a plaintext "@handle" substring
+  check. **Real loss, not a nicety**: `salt-agent-sdk`'s `MessageContext`
+  does not expose the raw `message.mentions` id array the way the old
+  webhook/update body did (confirmed: not a field on `MessageContext`,
+  `webhook.ts` read). This plugin's group @mention etiquette used to be an
+  exact "is this agent's id in the mentions array" check; it is now a
+  heuristic that can miss a mention a client attached without also writing
+  "@handle" into the message body, and can rarely false-positive on a
+  message that merely quotes "@handle." A new `handle` config field feeds
+  it (`openclaw.plugin.json`); with no `handle` configured, group messages
+  are never answered (logged once, not per-message) -- a DM is unaffected.
+  If `salt-agent-sdk` ever surfaces the real mentions array on
+  `MessageContext`, switch back to an exact check.
+- **Open rooms.** `ctx.encrypted === false` (from the SDK) is threaded
+  straight through to OpenClaw's inbound event as `raw.encrypted`, no
+  decrypt attempted either way (the SDK already didn't attempt one).
+  Outbound: `rest.ts#isOpenRoom` (a small `GET /api/v1/chats/:id` helper,
+  since neither the SDK's `getChatMembers` nor this plugin's old REST
+  client read the chat-level `encrypted` flag) gates a plain
+  `client.postPlainMessage` vs. an encrypted `createReplySender` call --
+  wired into the one real outbound call site that existed,
+  `outbound.attachedResults.sendText` (previously a hard stub that threw
+  unconditionally, "not wired yet," for BOTH encrypted and plain chats --
+  see the 2026-09-18 entry below; fixed here via a module-scoped mutable
+  `runtimeRef` since `sendText`'s closure is built before `startSaltChannel`
+  ever runs and has no way to receive deps as an argument). `isOpenRoom`
+  fails CLOSED (an unreadable lookup is treated as "still encrypted")
+  rather than risk a plaintext leak into a real E2E chat on an error.
+- **`deliveredBecause` -- a live cross-lane staleness gotcha, RESOLVED same day.** `MessageContext.deliveredBecause`
+  landed in `salt-agent-sdk` `src/webhook.ts` (0.10.1, merged same day by
+  the sibling `sdk-cable` lane) but this plugin's `node_modules/salt-agent-sdk`
+  symlink's `dist/` (both the `.d.ts` AND the compiled `.js` -- checked
+  both) still predated that commit when this entry was first written, so
+  depending on the typed field failed this plugin's build, and would have
+  read `undefined` at runtime too even if the type check were bypassed. Read
+  via a loose cast at first (so this plugin's build didn't hard-depend on
+  the sibling repo's build-artifact timing), deliberately not fixed by
+  running a build in `../salt-agent-sdk` from here -- that repo was a
+  different lane's working tree in this session, not this task's call to
+  touch. The sibling lane rebuilt its `dist/` shortly after (confirmed via
+  `grep deliveredBecause dist/webhook.js` and the file's mtime moving past
+  `src/webhook.ts`'s), and `team-lead` flagged the same thing -- switched
+  `channel.ts`'s `raw.deliveredBecause` from the loose cast to the real
+  typed `ctx.deliveredBecause` in a follow-up commit once confirmed. Both
+  `tsc -p tsconfig.json` and `npx vitest run` (61/61) stayed clean across
+  the switch.
+- **Interests + the Commons.** New config: `interests: {mode, keywords?}`
+  and `joinCommons: boolean`. `startSaltChannel` joins the Commons at
+  startup when `joinCommons` is set (`rest.ts#getPublicConfig` for
+  `commons_chat_id`, `rest.ts#joinPublicChat`, then
+  `client.setChatSubscription`), and a new `onChatOpened` handler
+  (`createChatOpenedHandler`) applies the same `interests` automatically
+  whenever this agent is added to any OTHER open room later, not just the
+  Commons. **API-CONTRACT-GUESS**: `joinPublicChat`'s route
+  (`POST /api/v1/chats/:id/join_public`) is inferred from this task's own
+  wording ("joins via join_public") and salt-api's existing action-route
+  convention (`/sidechain`, `/typing`, `/hide`, `/lock`) -- salt-api's
+  actual Commons routes were still in flight on a sibling lane
+  (`open-rooms-api`) at write time and not available in this checkout
+  (`salt-api` here sat at 0.80.1, one release behind the 0.81.0 contract
+  this task cited) to confirm against. Verify this path once that lane
+  ships and update `rest.ts#joinPublicChat`'s doc comment.
+- **`pollTimeoutSeconds` config field removed** (no longer meaningful --
+  there is no poll timeout any more); `pollLimit` stays but now means the
+  socket client's backfill page size, documented as such in
+  `openclaw.plugin.json`.
+- 61 tests passing (was 76 before this pass -- net fewer tests because the
+  poll-loop and envelope-verification suites, ~30 tests total, are gone
+  along with the code they tested; this pass also added ~15 new tests for
+  the mention heuristic, open-room detection, interests, and the Commons),
+  `tsc -p tsconfig.json` and `npm run build` both clean.
+- **Left alone / out of scope for this pass**: `salt-mcp`'s missing
+  `GET /api/v1/cards/:id` and the AgentKit provider's "one poller per
+  agent" constraint (both called out by this task's own brief as belonging
+  to a different repo/lane, not this one).
+
+---
+
 ## 2026-09-22 alignment pass (salt-agent-sdk 0.8, round-4 socket contract)
 
 - `SALT_POLL_TIMEOUT_SECONDS` default (and `channel.ts`'s `pollTimeoutSeconds`
@@ -212,7 +313,10 @@ plugin hands it to OpenClaw's actual agent turn machinery."
    `session-store-runtime` -- a multi-thousand-line pipeline, not a single
    function call, for every bundled channel that has it). This plugin calls
    `runChannelInboundEvent({channelId, raw, chatId, senderId, text, isGroup,
-   mentionsSelf})` (`src/channel.ts`'s `createUpdateHandler`) as the most
+   mentionsSelf})` (`src/channel.ts`'s `createMessageHandler`, renamed from
+   `createUpdateHandler` in the 2026-09-22 open-rooms pass above once it
+   started reading a `MessageContext` instead of a raw poll update row) as
+   the most
    plausible single entrypoint name found by grepping
    `channel-inbound.ts`'s exports, with a hand-written, deliberately loose
    parameter type in `src/types/openclaw-plugin-sdk.d.ts`. **This is
@@ -222,21 +326,24 @@ plugin hands it to OpenClaw's actual agent turn machinery."
    passes into its own inbound pipeline call and correct this shape.
 
 2. **Recovering the running client/identity inside
-   `outbound.attachedResults.sendText`.** The doc's own example shows
-   `sendText: async (params) => {...}` receiving only `params.to`/
-   `params.text` -- no visible way to reach this plugin's `SaltClient`,
-   account, or PGP key from inside that closure signature alone. This
-   plugin's `saltChannelPlugin.outbound.attachedResults.sendText`
-   deliberately throws a clear "not wired yet" error rather than guess at
-   an accessor that might not exist, so a broken guess doesn't masquerade
-   as working. The REAL send path this plugin proved end to end is
-   `createReplySender` (`src/channel.ts`), which the socket bridge itself
-   uses directly with its own resolved client/account -- it just isn't
-   reachable through the shared `message` tool's declared `outbound`
-   surface yet. Fixing this needs either a documented per-call context
-   argument on `sendText` this effort didn't find, or a module-level
-   runtime registry pattern (several bundled channels' `runtime-api.ts` /
-   `setRuntime` files hint at this, but weren't traced fully).
+   `outbound.attachedResults.sendText`.** RESOLVED 2026-09-22 (open-rooms
+   pass): the doc's own example shows `sendText: async (params) => {...}`
+   receiving only `params.to`/`params.text` -- no visible way to reach this
+   plugin's `SaltClient`, account, or PGP key from inside that closure
+   signature alone, and this plugin used to throw a hard "not wired yet"
+   error there instead of guessing at an accessor that might not exist.
+   Fixed via the module-level runtime registry pattern this entry already
+   guessed at: `channel.ts`'s `runtimeRef` (a plain `{current?: SaltRuntimeDeps}`
+   box, module-scoped, set once by `startSaltChannel`) -- `sendText`'s
+   closure is built at module-load time, before `startSaltChannel` ever
+   runs, but reads `runtimeRef.current` at CALL time, so the ordering
+   works. `sendText` now branches on `rest.ts#isOpenRoom` and posts plain
+   (`postPlainMessage`) or via `createReplySender`, same logic factored
+   into the directly-testable `sendChannelText`. Still unverified: whether
+   the real OpenClaw host ever calls `sendText` before `registerFull` has
+   finished (this now throws a clear message in that case rather than
+   silently no-op'ing); trace that ordering guarantee against a real
+   compiled host before relying on it in production.
 
 3. **`resolveCurrentChatId` inside a tool's execute call.** Both Salt tools
    (`salt_post_card`, `salt_request_payment`) need "which chat is this turn

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyChat, mapMessageEventToInbound } from "./inbound-mapper.js";
+import { classifyChat, mentionsSelfByHandle } from "./inbound-mapper.js";
 
 const SELF_AGENT_ID = "agent-self";
 
@@ -54,116 +54,36 @@ describe("classifyChat", () => {
   });
 });
 
-describe("mapMessageEventToInbound", () => {
-  const baseMessage = {
-    chat_id: "chat-1",
-    message_id: "msg-1",
-    message: "-----BEGIN PGP MESSAGE----- ... -----END PGP MESSAGE-----",
-    user: { id: "human-1", username: "dan", display_name: "Dan", account_type: "User" },
-    mentions: [],
-  };
-
-  it("maps a DM message with sender and empty mentions", async () => {
-    const result = await mapMessageEventToInbound(
-      { message: baseMessage, chat: { users: [{ id: SELF_AGENT_ID }, { id: "human-1" }] } },
-      { selfAgentId: SELF_AGENT_ID, decryptedText: "hey there" },
-    );
-    expect(result).toEqual({
-      chatId: "chat-1",
-      roomId: "chat-1",
-      kind: "dm",
-      sender: { id: "human-1", handle: "dan", displayName: "Dan", isAgent: false },
-      text: "hey there",
-      mentionsSelf: false,
-      mentionedIds: [],
-      isLane: false,
-      laneKind: undefined,
-      attachment: undefined,
-      raw: { chatMeta: { users: [{ id: SELF_AGENT_ID }, { id: "human-1" }] }, message: baseMessage },
-    });
+describe("mentionsSelfByHandle", () => {
+  it("is false with no configured handle, even if the text mentions someone", () => {
+    expect(mentionsSelfByHandle("hey @salt_bot can you help?", undefined)).toBe(false);
   });
 
-  it("sets mentionsSelf when this agent's id is in message.mentions", async () => {
-    const message = { ...baseMessage, mentions: ["someone-else", SELF_AGENT_ID] };
-    const result = await mapMessageEventToInbound(
-      {
-        message,
-        chat: {
-          users: [{ id: SELF_AGENT_ID }, { id: "human-1" }, { id: "human-2" }],
-        },
-      },
-      { selfAgentId: SELF_AGENT_ID, decryptedText: "@salt_bot help" },
-    );
-    expect(result?.kind).toBe("group");
-    expect(result?.mentionsSelf).toBe(true);
-    expect(result?.mentionedIds).toEqual(["someone-else", SELF_AGENT_ID]);
+  it("matches a plain @handle mention", () => {
+    expect(mentionsSelfByHandle("hey @salt_bot can you help?", "salt_bot")).toBe(true);
   });
 
-  it("mentionsSelf is case-insensitive", async () => {
-    const message = { ...baseMessage, mentions: ["AGENT-SELF"] };
-    const result = await mapMessageEventToInbound(
-      { message, chat: { users: [{ id: SELF_AGENT_ID }, { id: "human-1" }] } },
-      { selfAgentId: SELF_AGENT_ID, decryptedText: "hi" },
-    );
-    expect(result?.mentionsSelf).toBe(true);
+  it("is case-insensitive", () => {
+    expect(mentionsSelfByHandle("hey @SALT_BOT can you help?", "salt_bot")).toBe(true);
   });
 
-  it("marks a lane message with roomId pointing back at the shared chat", async () => {
-    const message = { ...baseMessage, chat_id: "lane-1" };
-    const result = await mapMessageEventToInbound(
-      {
-        message,
-        chat: {
-          coaching_for_chat_id: "chat-1",
-          lane_kind: "consult",
-          users: [{ id: SELF_AGENT_ID }, { id: "other-agent" }],
-        },
-      },
-      { selfAgentId: SELF_AGENT_ID, decryptedText: "consult question" },
-    );
-    expect(result?.chatId).toBe("lane-1");
-    expect(result?.roomId).toBe("chat-1");
-    expect(result?.isLane).toBe(true);
-    expect(result?.laneKind).toBe("consult");
+  it("matches at the start of the message", () => {
+    expect(mentionsSelfByHandle("@salt_bot are you there?", "salt_bot")).toBe(true);
   });
 
-  it("returns null for a system event", async () => {
-    const message = { ...baseMessage, event_type: "call_missed" };
-    const result = await mapMessageEventToInbound(
-      { message, chat: undefined },
-      { selfAgentId: SELF_AGENT_ID, decryptedText: "" },
-    );
-    expect(result).toBeNull();
+  it("does not match a longer handle that merely contains this one as a substring", () => {
+    expect(mentionsSelfByHandle("ask @salt_bot_two instead", "salt_bot")).toBe(false);
   });
 
-  it("returns null when the row has no sender", async () => {
-    const message = { ...baseMessage, user: undefined };
-    const result = await mapMessageEventToInbound(
-      { message, chat: undefined },
-      { selfAgentId: SELF_AGENT_ID, decryptedText: "hi" },
-    );
-    expect(result).toBeNull();
+  it("does not match when the handle appears with no @ at all", () => {
+    expect(mentionsSelfByHandle("salt_bot, are you there?", "salt_bot")).toBe(false);
   });
 
-  it("carries an attachment through when provided", async () => {
-    const message = { ...baseMessage, resource_type: "Attachment" };
-    const result = await mapMessageEventToInbound(
-      { message, chat: { users: [{ id: SELF_AGENT_ID }, { id: "human-1" }] } },
-      {
-        selfAgentId: SELF_AGENT_ID,
-        decryptedText: "",
-        attachment: { filename: "photo.jpg", contentType: "image/jpeg", size: 1024 },
-      },
-    );
-    expect(result?.attachment).toEqual({ filename: "photo.jpg", contentType: "image/jpeg", size: 1024 });
+  it("does not match an unrelated message", () => {
+    expect(mentionsSelfByHandle("what time is the meeting?", "salt_bot")).toBe(false);
   });
 
-  it("marks isAgent true for an agent sender", async () => {
-    const message = { ...baseMessage, user: { id: "other-agent", account_type: "Agent" } };
-    const result = await mapMessageEventToInbound(
-      { message, chat: { users: [{ id: SELF_AGENT_ID }, { id: "other-agent" }] } },
-      { selfAgentId: SELF_AGENT_ID, decryptedText: "hello from another agent" },
-    );
-    expect(result?.sender.isAgent).toBe(true);
+  it("escapes regex-special characters in the configured handle", () => {
+    expect(mentionsSelfByHandle("hey @salt.bot+1 there", "salt.bot+1")).toBe(true);
   });
 });

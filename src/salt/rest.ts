@@ -1,11 +1,13 @@
-// Small REST helpers for salt-api endpoints salt-agent-sdk 0.7.1 doesn't
-// wrap yet: the socket-mode long-poll contract itself (brand new -- see
-// design-fleet/runs/2026-09-17-distribution/LANES.md's "Socket mode
-// contract", built by a sibling lane in parallel with this plugin), the
-// delivery-mode switch, a plain (non-invoice) payment request on the
-// TransferRequest rail, and reactions. Everything else (postMessage,
-// postCard/updateCard, signalTyping, wallets, ...) goes through
-// salt-agent-sdk's own `createSaltClient` -- see src/channel.ts.
+// Small REST helpers for salt-api endpoints salt-agent-sdk 0.10.0 doesn't
+// wrap yet: a plain (non-invoice) payment request on the TransferRequest
+// rail, reactions, reading a chat's `encrypted` flag (open rooms), and the
+// Commons (the shared public room -- `GET /api/v1/config`'s
+// `commons_chat_id` plus joining it).
+//
+// The socket-mode long-poll contract itself and the delivery-mode switch
+// (`setDeliveryMode`) used to live here too -- both are now
+// salt-agent-sdk's job (`createSocketClient`, `client.setDeliveryMode`),
+// since this plugin no longer hand-rolls polling. See channel.ts.
 //
 // Kept deliberately thin and dependency-free (plain `fetch`, injectable for
 // tests) rather than reaching into salt-agent-sdk's unexported internal
@@ -54,56 +56,6 @@ async function saltRequest<T>(
   return (await res.json()) as T;
 }
 
-/** `PATCH /api/v1/agents/delivery {mode}` -- the setup step that puts this
- *  agent into socket mode instead of webhook delivery. Same auth as
- *  `PATCH /api/v1/agents/callback` (this agent's own api-key). */
-export async function setDeliveryMode(
-  options: SaltRestOptions,
-  mode: "socket" | "webhook",
-): Promise<unknown> {
-  return saltRequest(options, "PATCH", "/api/v1/agents/delivery", { mode });
-}
-
-export interface SocketUpdateRow {
-  id: string | number;
-  delivery_id?: string;
-  event: string;
-  headers: Record<string, string>;
-  body: string;
-  created_at: string;
-}
-
-export interface FetchAgentUpdatesParams {
-  /** Omit (or pass `undefined`) on a fresh start -- see socket-poller.ts's
-   *  `pollOnce`, which is the only caller and already resolves a fresh/lost
-   *  cursor to `undefined` rather than "0" (round-4 socket contract,
-   *  LANES.md K2: an omitted `after` lets salt-api's own server-side ack
-   *  apply instead of replaying up to 7 days of retained outbox). */
-  after?: string;
-  timeoutSeconds?: number;
-  limit?: number;
-}
-
-export interface FetchAgentUpdatesResult {
-  updates: SocketUpdateRow[];
-  cursor: string;
-}
-
-/** `GET /api/v1/agent/updates?after=&timeout=&limit=` -- the socket-mode
- *  short-poll contract. `timeoutSeconds` is clamped server-side to 0-2s
- *  (round 3/4 revision -- it was a real long-poll clamped 0-25 before H1),
- *  `limit` 1-100; this helper does not re-validate, it just forwards. */
-export async function fetchAgentUpdates(
-  options: SaltRestOptions,
-  params: FetchAgentUpdatesParams,
-): Promise<FetchAgentUpdatesResult> {
-  const query = new URLSearchParams();
-  if (params.after !== undefined) query.set("after", params.after);
-  if (params.timeoutSeconds !== undefined) query.set("timeout", String(params.timeoutSeconds));
-  if (params.limit !== undefined) query.set("limit", String(params.limit));
-  return saltRequest(options, "GET", `/api/v1/agent/updates?${query.toString()}`);
-}
-
 export interface CreatePaymentRequestParams {
   chatId: string;
   /** One of this agent's own active wallet ids -- the wallet the payment
@@ -137,11 +89,89 @@ export async function createPaymentRequest(
 }
 
 /** `POST /api/v1/messages/:id/reactions` -- toggle semantics per
- *  CLAUDE.md's Messaging extras. Not wrapped by salt-agent-sdk 0.7.1 yet. */
+ *  CLAUDE.md's Messaging extras. Not wrapped by salt-agent-sdk yet. */
 export async function addReaction(
   options: SaltRestOptions,
   messageId: string,
   emoji: string,
 ): Promise<unknown> {
   return saltRequest(options, "POST", `/api/v1/messages/${messageId}/reactions`, { emoji });
+}
+
+export interface SaltChatInfo {
+  id: string;
+  /** False for an open room -- plain text, no PGP (salt-api 0.81.0's open
+   *  rooms). Absent/true for an ordinary end-to-end encrypted chat.
+   *  salt-agent-sdk's own `SaltChat` type doesn't type this field yet
+   *  either (both read it through the same untyped-catch-all shape). */
+  encrypted?: boolean;
+  [key: string]: unknown;
+}
+
+/** `GET /api/v1/chats/:id` -- used here only to read the chat-level
+ *  `encrypted` flag (open rooms) before deciding whether a reply should be
+ *  posted plain (`client.postPlainMessage`) or PGP-encrypted
+ *  (`client.postMessage`/`ctx.reply`). salt-agent-sdk's own
+ *  `client.getChatMembers`/`getChatMessages` fetch the same resource but
+ *  throw the rest of it away. */
+export async function getChat(options: SaltRestOptions, chatId: string): Promise<SaltChatInfo> {
+  return saltRequest(options, "GET", `/api/v1/chats/${chatId}?_=${Date.now()}`);
+}
+
+/** Best-effort: is `chatId` an open room right now? Fails closed (treats an
+ *  unreadable/errored lookup as "not open", i.e. still requiring
+ *  encryption) rather than risking a plaintext send into what might
+ *  actually be an end-to-end encrypted chat. */
+export async function isOpenRoom(options: SaltRestOptions, chatId: string, logger?: { error: (msg: string) => void }): Promise<boolean> {
+  try {
+    const chat = await getChat(options, chatId);
+    return chat.encrypted === false;
+  } catch (err) {
+    logger?.error(`[salt] could not determine whether chat ${chatId} is an open room (assuming encrypted): ${(err as Error).message}`);
+    return false;
+  }
+}
+
+export interface SaltPublicConfig {
+  /** The id of Salt's Commons -- the one shared, open (unencrypted) public
+   *  room every agent can ask to join. Absent on a deployment with no
+   *  Commons configured. */
+  commons_chat_id?: string;
+  [key: string]: unknown;
+}
+
+/** `GET /api/v1/config` -- unauthenticated, public. Read here only for
+ *  `commons_chat_id`; salt-agent-sdk doesn't wrap this endpoint (it's
+ *  mostly client-app configuration, not an agent concern) except for this
+ *  one field this plugin's "join the Commons" setup step needs. */
+export async function getPublicConfig(options: Pick<SaltRestOptions, "host" | "fetchImpl">): Promise<SaltPublicConfig> {
+  const doFetch = options.fetchImpl ?? fetch;
+  const url = `${options.host.replace(/\/+$/, "")}/api/v1/config`;
+  const res = await doFetch(url);
+  if (!res.ok) {
+    const text = await res.text().catch(() => undefined);
+    throw new SaltRestError("GET", url, res.status, text);
+  }
+  return (await res.json()) as SaltPublicConfig;
+}
+
+/**
+ * `POST /api/v1/chats/:id/join_public` -- joins this agent to an open
+ * public room (the Commons, or any other `open_invite`/public chat) it
+ * isn't already a member of. Idempotent-in-spirit (an already-a-member
+ * call should be a harmless no-op on salt-api's side); this helper does
+ * not itself special-case a 409/422 "already a member" response beyond
+ * letting it surface as a SaltRestError for the caller to log and ignore.
+ *
+ * API-CONTRACT-GUESS: the exact route/verb for "join a public chat" is
+ * inferred from the naming this plugin's task brief used ("joins via
+ * join_public") and from salt-api's existing action-route convention
+ * (`/sidechain`, `/typing`, `/hide`, `/lock` -- a POST to a sub-resource
+ * named after the verb, no body). Not independently confirmed against
+ * salt-api 0.81.0 source (not available in this checkout at write time --
+ * that work was still in flight on a sibling lane). Verify this path once
+ * salt-api's Commons routes ship; see HANDOFF.md.
+ */
+export async function joinPublicChat(options: SaltRestOptions, chatId: string): Promise<unknown> {
+  return saltRequest(options, "POST", `/api/v1/chats/${chatId}/join_public`);
 }
