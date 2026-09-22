@@ -328,18 +328,15 @@ export function createMessageHandler(deps: SaltRuntimeDeps) {
         roomId: ctx.roomId,
         // Open rooms (interests): why THIS delivery reached this agent --
         // "mention"/"reply"/"keyword"/"all" -- present only alongside
-        // `encrypted: false` (salt-agent-sdk 0.10.1's
-        // MessageContext.deliveredBecause; undefined for an ordinary
-        // encrypted chat, where every member gets every message). Read via
-        // a loose cast rather than the typed field: at the time this was
-        // written, salt-agent-sdk's own compiled `dist/` (what this
-        // plugin's `node_modules/salt-agent-sdk` symlink resolves to)
-        // still predated the commit that added this field to `src/`, so
-        // depending on the typed property failed the build here even
-        // though the field is real and merged. Once that sibling repo's
-        // own `dist/` is rebuilt (its own lane's responsibility, not this
-        // plugin's), the real value flows through with no change needed.
-        deliveredBecause: (ctx as unknown as { deliveredBecause?: string }).deliveredBecause,
+        // `encrypted: false` (undefined for an ordinary encrypted chat,
+        // where every member gets every message). salt-agent-sdk's
+        // MessageContext.deliveredBecause (0.10.1). Was read via a loose
+        // cast here for a few minutes on 2026-09-22 because this plugin's
+        // node_modules/salt-agent-sdk symlink's compiled dist/ momentarily
+        // predated the commit that added this field to src/ -- that
+        // sibling repo's dist/ has since been rebuilt, so the typed field
+        // is used directly again.
+        deliveredBecause: ctx.deliveredBecause,
       },
       chatId,
       senderId: String(ctx.senderId),

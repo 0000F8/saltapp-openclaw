@@ -51,20 +51,24 @@ delivery, `PUT/DELETE /api/v1/chats/:id/subscription`).
   ever runs and has no way to receive deps as an argument). `isOpenRoom`
   fails CLOSED (an unreadable lookup is treated as "still encrypted")
   rather than risk a plaintext leak into a real E2E chat on an error.
-- **`deliveredBecause` -- a live cross-lane staleness gotcha.** `MessageContext.deliveredBecause`
+- **`deliveredBecause` -- a live cross-lane staleness gotcha, RESOLVED same day.** `MessageContext.deliveredBecause`
   landed in `salt-agent-sdk` `src/webhook.ts` (0.10.1, merged same day by
   the sibling `sdk-cable` lane) but this plugin's `node_modules/salt-agent-sdk`
   symlink's `dist/` (both the `.d.ts` AND the compiled `.js` -- checked
-  both) still predated that commit at the time this was written, so
+  both) still predated that commit when this entry was first written, so
   depending on the typed field failed this plugin's build, and would have
-  read `undefined` at runtime too even if the type check were bypassed.
-  Read via a loose cast in `channel.ts` (`raw.deliveredBecause`) so this
-  plugin's build doesn't hard-depend on the sibling repo's build-artifact
-  timing; the real value will flow through automatically once that repo's
-  `dist/` is rebuilt (not this plugin's responsibility). Did **not** run a
-  build in `../salt-agent-sdk` from here to fix this -- that repo is a
-  different lane's working tree in this session, and touching its build
-  output wasn't this task's call to make.
+  read `undefined` at runtime too even if the type check were bypassed. Read
+  via a loose cast at first (so this plugin's build didn't hard-depend on
+  the sibling repo's build-artifact timing), deliberately not fixed by
+  running a build in `../salt-agent-sdk` from here -- that repo was a
+  different lane's working tree in this session, not this task's call to
+  touch. The sibling lane rebuilt its `dist/` shortly after (confirmed via
+  `grep deliveredBecause dist/webhook.js` and the file's mtime moving past
+  `src/webhook.ts`'s), and `team-lead` flagged the same thing -- switched
+  `channel.ts`'s `raw.deliveredBecause` from the loose cast to the real
+  typed `ctx.deliveredBecause` in a follow-up commit once confirmed. Both
+  `tsc -p tsconfig.json` and `npx vitest run` (61/61) stayed clean across
+  the switch.
 - **Interests + the Commons.** New config: `interests: {mode, keywords?}`
   and `joinCommons: boolean`. `startSaltChannel` joins the Commons at
   startup when `joinCommons` is set (`rest.ts#getPublicConfig` for
