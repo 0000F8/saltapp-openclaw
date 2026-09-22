@@ -19,6 +19,9 @@
   have that field anymore). Registration now sends only `public_key`/
   `public_fingerprint`; the private key stays local, matching the Custody
   section's own (already-correct) description of this plugin's trust model.
+- `assets/icon.png` added -- ClawHub's real catalog artwork requirement
+  (see "Other decisions worth knowing about" below), a copy of the real
+  Salt tile, never hand-drawn.
 - `salt-agent-sdk` dependency bumped to `^0.8.0`.
 - Left alone: signature verification stays local (`envelope.ts`) -- the SDK
   still has no standalone verifier export, only `createDispatcher`'s
@@ -285,10 +288,11 @@ them against the actual compiled `openclaw` package.
   currently reach the agent at all. This needs its own OpenClaw-side
   surface (a tool result? a system event? unclear without open question #1
   above being resolved first) rather than guessing blind.
-- **No `assets/icon.png`.** ClawHub's plugin packaging (`docs/publishing.md`
-  in the clawhub repo) wants a bundled `assets/icon.png` (PNG, <=512 KiB) for
-  catalog artwork, or it falls back to the category glyph. Not created --
-  no image-generation step was in scope for this pass.
+- ~~**No `assets/icon.png`.**~~ **Fixed 2026-09-22**: `assets/icon.png` is
+  now the real Salt tile (a copy of `salt-fe/public/logo512.png`, itself
+  `salt-fe/brand/salt-tile.svg` rendered to 512x512 PNG by that folder's
+  `build.sh`, ~5KB -- well under ClawHub's 512 KiB cap), not hand-drawn.
+  `package.json`'s `files` allowlist already included `"assets"`.
 - **No live integration test.** Every test mocks REST and the OpenClaw SDK
   surface; nothing here has run against a real salt-api (the socket route
   doesn't exist yet) or a real OpenClaw Gateway. See UAT steps above for
