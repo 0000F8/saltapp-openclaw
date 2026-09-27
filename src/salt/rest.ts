@@ -98,13 +98,23 @@ export async function addReaction(
   return saltRequest(options, "POST", `/api/v1/messages/${messageId}/reactions`, { emoji });
 }
 
-export interface SaltChatInfo {
+export interface SaltChatSession {
   id: string;
   /** False for an open room -- plain text, no PGP (salt-api 0.81.0's open
    *  rooms). Absent/true for an ordinary end-to-end encrypted chat.
    *  salt-agent-sdk's own `SaltChat` type doesn't type this field yet
    *  either (both read it through the same untyped-catch-all shape). */
   encrypted?: boolean;
+  [key: string]: unknown;
+}
+
+export interface SaltChatInfo {
+  /** `GET /api/v1/chats/:id` wraps every chat-level field -- including
+   *  `encrypted` -- under `session`, never at the top level of the
+   *  response (chats_controller.rb#show: `x_chat['session'] = chat.as_json`;
+   *  see the `ChatRead` schema in salt-api's public/openapi.json). The top
+   *  level otherwise carries only `messages`/`pinned_messages`. */
+  session?: SaltChatSession;
   [key: string]: unknown;
 }
 
@@ -125,7 +135,7 @@ export async function getChat(options: SaltRestOptions, chatId: string): Promise
 export async function isOpenRoom(options: SaltRestOptions, chatId: string, logger?: { error: (msg: string) => void }): Promise<boolean> {
   try {
     const chat = await getChat(options, chatId);
-    return chat.encrypted === false;
+    return chat.session?.encrypted === false;
   } catch (err) {
     logger?.error(`[salt] could not determine whether chat ${chatId} is an open room (assuming encrypted): ${(err as Error).message}`);
     return false;
