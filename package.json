@@ -1,6 +1,6 @@
 {
   "name": "saltapp-openclaw",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenClaw channel plugin for Salt (saltapp.ai): gives an OpenClaw agent a Salt handle -- DMs and @mentions in, encrypted replies/cards/payment requests out -- over Salt's socket-mode long-poll contract (no public URL required).",
   "license": "MIT",
   "author": "0x0000F8 <0000F8@proton.me>",
