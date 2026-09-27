@@ -40,7 +40,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "salt-agent-sdk": "^0.10.0"
+    "salt-agent-sdk": "^0.12.2"
   },
   "devDependencies": {
     "typescript": "^5.6.0",
@@ -48,9 +48,9 @@
   },
   "openclaw": {
     "extensions": [
-      "./index.js"
+      "./dist/index.js"
     ],
-    "setupEntry": "./setup-entry.js",
+    "setupEntry": "./dist/setup-entry.js",
     "channel": {
       "id": "salt",
       "label": "Salt",
@@ -59,7 +59,9 @@
       "blurb": "Give this OpenClaw agent a Salt handle: DMs, @mentions in groups, encrypted replies, cards, and payment requests -- delivered over Salt's socket-mode long-poll (no public URL needed).",
       "docsLabel": "salt",
       "markdownCapable": false,
-      "approvalFlags": ["native"]
+      "approvalFlags": [
+        "native"
+      ]
     },
     "install": {
       "clawhubSpec": "clawhub:saltapp-openclaw",
