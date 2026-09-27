@@ -114,6 +114,14 @@ signature check and DM/group/mentions mapping itself, deliberately leaving
   sign with `Math.floor(Date.now() / 1000)` (see `socket-poller.test.ts`),
   or inject `nowSeconds` directly (see `envelope.test.ts`).
 
+**The chat payload nests everything under `session`.** `GET /api/v1/chats/:id` puts every
+chat-level field — `encrypted` included — under `session`; there is no top-level `encrypted`
+(or `name`, or any other chat column). A fixture for this endpoint must put those fields under
+`session`, or it validates the wrong behaviour instead of catching it: that is exactly how
+open-room support stayed dead here for weeks with a green suite, including a test named for
+posting plain text into an open room. As of salt-api 0.98.5 the `chat_opened` webhook carries
+`encrypted` directly, so a handler no longer needs that second call at all.
+
 ## Conventions carried over from the Salt monorepo
 
 - Any Salt account created by tooling/tests is named `SALT-…` with a
