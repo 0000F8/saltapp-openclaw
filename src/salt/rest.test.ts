@@ -48,23 +48,40 @@ describe("addReaction", () => {
 
 describe("getChat", () => {
   it("GETs /api/v1/chats/:id with the api-key header", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ id: "chat-1", encrypted: false }));
+    // Real GET /api/v1/chats/:id shape (chats_controller.rb#show,
+    // ChatRead in public/openapi.json): the whole payload is
+    // `{session: {...}, messages: [...], pinned_messages: [...]}` --
+    // `encrypted` (and every other chat-level field) lives under
+    // `session`, never at the top level. A fixture that put `encrypted`
+    // at the top level here previously matched the real bug in
+    // `isOpenRoom` instead of catching it.
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ session: { id: "chat-1", encrypted: false } }));
     const result = await getChat({ host: "https://saltapp.ai", apiKey: "key-1", fetchImpl }, "chat-1");
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
     expect(url).toContain("https://saltapp.ai/api/v1/chats/chat-1");
     expect((init.headers as Record<string, string>)["api-key"]).toBe("key-1");
-    expect(result).toEqual({ id: "chat-1", encrypted: false });
+    expect(result).toEqual({ session: { id: "chat-1", encrypted: false } });
   });
 });
 
 describe("isOpenRoom", () => {
-  it("is true when the chat's encrypted flag is exactly false", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ id: "chat-1", encrypted: false }));
+  it("is true when the chat's session.encrypted flag is exactly false", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ session: { id: "chat-1", encrypted: false } }));
     expect(await isOpenRoom({ host: "https://saltapp.ai", apiKey: "key-1", fetchImpl }, "chat-1")).toBe(true);
   });
 
-  it("is false when encrypted is absent (ordinary E2E chat)", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ id: "chat-1" }));
+  it("is false when session.encrypted is absent (ordinary E2E chat)", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ session: { id: "chat-1" } }));
+    expect(await isOpenRoom({ host: "https://saltapp.ai", apiKey: "key-1", fetchImpl }, "chat-1")).toBe(false);
+  });
+
+  it("is false when session.encrypted is true", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ session: { id: "chat-1", encrypted: true } }));
+    expect(await isOpenRoom({ host: "https://saltapp.ai", apiKey: "key-1", fetchImpl }, "chat-1")).toBe(false);
+  });
+
+  it("is false when the response carries a stray top-level `encrypted` and no session (never trust the top level)", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ id: "chat-1", encrypted: false }));
     expect(await isOpenRoom({ host: "https://saltapp.ai", apiKey: "key-1", fetchImpl }, "chat-1")).toBe(false);
   });
 

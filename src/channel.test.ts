@@ -317,7 +317,12 @@ describe("createChatOpenedHandler", () => {
 describe("sendChannelText", () => {
   it("posts plain text into an open room without encrypting", async () => {
     const deps = makeDeps([{ id: "agent-self", public_key: "pub-self" }, { id: "human-1", public_key: "pub-human-1" }]);
-    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: "chat-1", encrypted: false }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    // Real GET /api/v1/chats/:id shape: `encrypted` lives under `session`,
+    // never at the top level (see rest.test.ts). This fixture used to put
+    // it at the top level, which matched -- and hid -- isOpenRoom's bug:
+    // it always compared `undefined === false` and the plain-text branch
+    // below was never actually reachable in production.
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ session: { id: "chat-1", encrypted: false } }), { status: 200, headers: { "Content-Type": "application/json" } }));
     deps.restOptions = { ...deps.restOptions, fetchImpl } as any;
 
     const result = await sendChannelText(deps as any, { to: "chat-1", text: "hello room" });
@@ -329,7 +334,7 @@ describe("sendChannelText", () => {
 
   it("encrypts for a chat that is not an open room", async () => {
     const deps = makeDeps([{ id: "agent-self", public_key: "pub-self" }, { id: "human-1", public_key: "pub-human-1" }]);
-    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: "chat-1" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ session: { id: "chat-1" } }), { status: 200, headers: { "Content-Type": "application/json" } }));
     deps.restOptions = { ...deps.restOptions, fetchImpl } as any;
 
     const result = await sendChannelText(deps as any, { to: "chat-1", text: "hello room" });
