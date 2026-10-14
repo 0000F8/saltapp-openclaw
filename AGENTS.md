@@ -16,36 +16,23 @@ and is not itself one of that file's subprojects).
 ## Commands
 
 ```bash
-npm install ../salt-agent-sdk --no-save   # run this FIRST -- see below, a
-                                           # bare `npm install` fails outright
+npm install       # salt-agent-sdk ^0.18.0 resolves from the npm registry
 npm test          # vitest run -- the whole suite, one invocation
 npx vitest run src/salt/rest.test.ts       # a single file
 npm run build     # tsc -p tsconfig.json -> dist/
 npx tsc -p tsconfig.json --noEmit          # type-check only
 ```
 
-Verified 2026-09-27: a bare `npm install` fails outright (`ETARGET`, no
-`node_modules` at all) because `package.json` depends on
-`salt-agent-sdk@^0.10.0` and the public npm registry only has `0.1.0` --
-`salt-agent-sdk`'s published version lags far behind this workspace's local
-checkout (0.12.2 as of this pass; salt-agent-sdk itself is not published to
-npm past 0.1.0 yet either). Run `npm install ../salt-agent-sdk --no-save`
-FIRST and skip the bare `npm install` entirely -- it both links the local
-sibling checkout and installs every other dependency in one pass (confirmed:
-"added 45 packages"). `npm test` (61/61), `npm run build`, and
-`npx tsc -p tsconfig.json --noEmit` all run clean afterward. The single-file
-example above used to name `src/salt/envelope.test.ts`, which no longer
-exists (see Architecture) -- updated to an existing file.
+`salt-agent-sdk` is on the public npm registry (0.18.0 published 2026-10-14), so a
+bare `npm install` works and `package-lock.json` is committed (registry tarballs only). To
+test against an unreleased sibling checkout, `npm install ../salt-agent-sdk --no-save`
+locally, and never commit a lockfile that records a `"link": true` entry. `npm test`
+(63/63), `npm run build` and `npx tsc -p tsconfig.json --noEmit` run clean. The single-file
+example above used to name `src/salt/envelope.test.ts`, which no longer exists (see
+Architecture) -- updated to an existing file.
 
-`package-lock.json` is gitignored on purpose: a local install's lockfile
-records `salt-agent-sdk`'s `node_modules` entry as `{"resolved":
-"../salt-agent-sdk", "link": true}`, a path that only exists on a machine
-with that sibling checkout. Regenerate it locally with the `npm install
-../salt-agent-sdk --no-save` command above; commit it once `salt-agent-sdk`
-is actually published to the public npm registry past 0.1.0. This plugin
-itself (`saltapp-openclaw`) is ALSO not published anywhere yet -- not to
-npm, not to ClawHub -- see HANDOFF.md's "ClawHub publish steps" for what
-that will take.
+Publishing: `saltapp-openclaw` goes to npm (`npm publish --access public`) and then to
+ClawHub -- see HANDOFF.md's "ClawHub publish steps".
 
 ## Architecture
 

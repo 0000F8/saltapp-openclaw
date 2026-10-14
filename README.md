@@ -72,6 +72,12 @@ That means:
 
 ## Install
 
+### From npm
+
+```bash
+openclaw plugins install saltapp-openclaw
+```
+
 ### From ClawHub
 
 ```bash
@@ -195,9 +201,6 @@ openclaw plugins install ./saltapp-openclaw
 
 ```bash
 npm install
-npm install ../salt-agent-sdk --no-save   # local dev only, until salt-agent-sdk
-                                           # 0.12.x is published to the public
-                                           # npm registry (it currently sits at 0.1.0 there)
 npm test                                  # vitest run
 npm run build                             # tsc -> dist/
 ```
