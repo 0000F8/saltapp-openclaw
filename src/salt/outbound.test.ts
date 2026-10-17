@@ -91,6 +91,7 @@ describe("sendEncryptedReply", () => {
       "cipher(pub-human-1,pub-human-2)",
       `cipher(${SELF_PUBLIC_KEY})`,
       ["human-1"],
+      {},
     );
     expect(result).toEqual({ id: "msg-99" });
   });
@@ -112,6 +113,73 @@ describe("sendEncryptedReply", () => {
 
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("human-2"));
     expect(postMessage).toHaveBeenCalled();
+  });
+});
+
+describe("send guard", () => {
+  const stale = (members: unknown[]) => Object.assign(new Error("409"), { status: 409, code: "stale_recipient_keys", body: { code: "stale_recipient_keys", members } });
+  const roster = () => [
+    { id: SELF_ID, publicKey: SELF_PUBLIC_KEY, fingerprint: "fp-self" },
+    { id: "human-1", publicKey: "pub-1", fingerprint: "fp-1" },
+  ];
+
+  it("sends recipient and sender fingerprints", async () => {
+    const encryptFor = vi.fn(async () => "cipher");
+    const postMessage = vi.fn(async () => ({ id: "m" }));
+    await sendEncryptedReply(
+      { encryptFor, getChatMembers: async () => roster(), postMessage },
+      { chatId: "c", text: "hi", selfAgentId: SELF_ID, selfPublicKey: SELF_PUBLIC_KEY },
+    );
+    expect(postMessage.mock.calls[0][4]).toEqual({ recipientFingerprints: { "human-1": "fp-1" }, senderFingerprint: "fp-self" });
+  });
+
+  it("omits the guard when a member's fingerprint is unknown", async () => {
+    const encryptFor = vi.fn(async () => "cipher");
+    const postMessage = vi.fn(async () => ({ id: "m" }));
+    await sendEncryptedReply(
+      { encryptFor, getChatMembers: async () => [{ id: "human-1", publicKey: "pub-1" }], postMessage },
+      { chatId: "c", text: "hi", selfAgentId: SELF_ID, selfPublicKey: SELF_PUBLIC_KEY },
+    );
+    expect(postMessage.mock.calls[0][4]).toEqual({});
+  });
+
+  it("re-encrypts once to the keys in a stale_recipient_keys refusal", async () => {
+    const encryptFor = vi.fn(async (_t: string, keys: string[]) => `cipher(${keys.join(",")})`);
+    const postMessage = vi
+      .fn()
+      .mockRejectedValueOnce(stale([{ id: "human-1", public_key: "pub-1-new", public_fingerprint: "fp-1-new" }]))
+      .mockResolvedValueOnce({ id: "m" });
+    const getChatMembers = vi.fn(async () => roster());
+    await sendEncryptedReply(
+      { encryptFor, getChatMembers, postMessage },
+      { chatId: "c", text: "hi", selfAgentId: SELF_ID, selfPublicKey: SELF_PUBLIC_KEY },
+    );
+    expect(postMessage).toHaveBeenCalledTimes(2);
+    expect(postMessage.mock.calls[1][1]).toBe("cipher(pub-1-new)");
+    expect(postMessage.mock.calls[1][4]).toEqual({ recipientFingerprints: { "human-1": "fp-1-new" }, senderFingerprint: "fp-self" });
+  });
+
+  it("does not loop: a second stale refusal is thrown", async () => {
+    const encryptFor = vi.fn(async () => "cipher");
+    const postMessage = vi.fn().mockRejectedValue(stale([{ id: "human-1", public_key: "k", public_fingerprint: "f" }]));
+    await expect(
+      sendEncryptedReply(
+        { encryptFor, getChatMembers: async () => roster(), postMessage },
+        { chatId: "c", text: "hi", selfAgentId: SELF_ID, selfPublicKey: SELF_PUBLIC_KEY },
+      ),
+    ).rejects.toThrow("409");
+    expect(postMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry other errors", async () => {
+    const postMessage = vi.fn().mockRejectedValue(Object.assign(new Error("x"), { status: 409, code: "pickup_required" }));
+    await expect(
+      sendEncryptedReply(
+        { encryptFor: async () => "c", getChatMembers: async () => roster(), postMessage },
+        { chatId: "c", text: "hi", selfAgentId: SELF_ID, selfPublicKey: SELF_PUBLIC_KEY },
+      ),
+    ).rejects.toThrow("x");
+    expect(postMessage).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -504,10 +504,10 @@ export function createReplySender(deps: SaltRuntimeDeps) {
         encryptFor,
         getChatMembers: async (id) => {
           const members = await deps.client.getChatMembers(deps.account.apiKey, id as SaltId);
-          return members.map((m) => ({ id: String(m.id), publicKey: m.public_key }));
+          return members.map((m) => ({ id: String(m.id), publicKey: m.public_key, fingerprint: m.public_fingerprint }));
         },
-        postMessage: (id, message, senderMessage, mentionIds) =>
-          deps.client.postMessage(deps.account.apiKey, id as SaltId, message, senderMessage, undefined, mentionIds as SaltId[] | undefined),
+        postMessage: (id, message, senderMessage, mentionIds, guard) =>
+          deps.client.postMessage(deps.account.apiKey, id as SaltId, message, senderMessage, undefined, mentionIds as SaltId[] | undefined, guard as { quiet?: boolean } | undefined), // guard fields need salt-agent-sdk >= the key-reset release; an older SDK ignores them
         logger: deps.logger,
       },
       { chatId, text, selfAgentId: deps.account.agentId, selfPublicKey: deps.account.publicKey, mentions },

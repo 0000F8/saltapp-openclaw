@@ -10,6 +10,35 @@
 export interface OutboundChatMember {
   id: string;
   publicKey?: string;
+  /** The key's public fingerprint, sent back as the opt-in send guard. */
+  fingerprint?: string;
+}
+
+/** The opt-in send guard (KEY_RESET_DESIGN.md 7): the fingerprint of every key the message was encrypted to. */
+export interface SendGuard {
+  recipientFingerprints?: Record<string, string>;
+  senderFingerprint?: string;
+}
+
+/** Guard fields for a roster. Empty unless EVERY keyed member carries a fingerprint: a missing one must not read as stale. */
+export function buildSendGuard(members: OutboundChatMember[], selfAgentId: string): SendGuard {
+  const keyed = members.filter((m) => m.publicKey);
+  if (!keyed.every((m) => m.fingerprint)) return {};
+  const isSelf = (m: OutboundChatMember) => m.id.toLowerCase() === selfAgentId.toLowerCase();
+  const guard: SendGuard = {
+    recipientFingerprints: Object.fromEntries(keyed.filter((m) => !isSelf(m)).map((m) => [m.id, m.fingerprint as string])),
+  };
+  const me = keyed.find(isSelf);
+  if (me) guard.senderFingerprint = me.fingerprint;
+  return guard;
+}
+
+/** The 409 `stale_recipient_keys` refusal carries the current members; null for any other error. */
+export function staleRecipientMembers(err: unknown): Array<{ id: string; public_key?: string; public_fingerprint?: string }> | null {
+  const e = err as { status?: number; code?: string; body?: { code?: string; members?: unknown } } | undefined;
+  if (!e || e.status !== 409) return null;
+  if ((e.code ?? e.body?.code) !== "stale_recipient_keys") return null;
+  return Array.isArray(e.body?.members) ? (e.body?.members as Array<{ id: string; public_key?: string; public_fingerprint?: string }>) : [];
 }
 
 export interface EncryptForMembersDeps {
@@ -65,6 +94,7 @@ export interface SendReplyDeps extends EncryptForMembersDeps {
     message: string,
     senderMessage: string,
     mentions?: string[],
+    guard?: SendGuard,
   ) => Promise<unknown>;
   signalTyping?: (chatId: string) => Promise<void>;
   logger?: { info: (msg: string) => void; error: (msg: string) => void };
@@ -86,20 +116,33 @@ export interface SendReplyParams {
  * future plain-reply path.
  */
 export async function sendEncryptedReply(deps: SendReplyDeps, params: SendReplyParams): Promise<unknown> {
-  const members = await deps.getChatMembers(params.chatId);
-  const { message, senderMessage, skippedMemberIds } = await encryptForMembers(
-    deps,
-    params.text,
-    members,
-    params.selfAgentId,
-    params.selfPublicKey,
-  );
-  if (skippedMemberIds.length > 0) {
-    deps.logger?.error(
-      `[chat ${params.chatId}] sending without ${skippedMemberIds.length} member(s) lacking a known public key: ${skippedMemberIds.join(", ")}`,
+  // Members are read now, at send time: never from a cache.
+  let members = await deps.getChatMembers(params.chatId);
+  for (let attempt = 0; ; attempt++) {
+    const { message, senderMessage, skippedMemberIds } = await encryptForMembers(
+      deps,
+      params.text,
+      members,
+      params.selfAgentId,
+      params.selfPublicKey,
     );
+    if (skippedMemberIds.length > 0) {
+      deps.logger?.error(
+        `[chat ${params.chatId}] sending without ${skippedMemberIds.length} member(s) lacking a known public key: ${skippedMemberIds.join(", ")}`,
+      );
+    }
+    try {
+      return await deps.postMessage(params.chatId, message, senderMessage, params.mentions, buildSendGuard(members, params.selfAgentId));
+    } catch (err) {
+      const fresh = staleRecipientMembers(err);
+      // Re-encrypt to the keys Salt sent back ONCE; a second refusal is thrown.
+      if (!fresh || attempt > 0) throw err;
+      members = members.map((m) => {
+        const f = fresh.find((x) => String(x.id).toLowerCase() === m.id.toLowerCase());
+        return f ? { ...m, publicKey: f.public_key ?? m.publicKey, fingerprint: f.public_fingerprint ?? m.fingerprint } : m;
+      });
+    }
   }
-  return deps.postMessage(params.chatId, message, senderMessage, params.mentions);
 }
 
 /** Best-effort typing signal; never throws (a typing indicator is a nicety,

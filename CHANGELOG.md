@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+**Send guard.** Every encrypted reply carries `recipient_fingerprints` and `sender_fingerprint` (the roster is read at send time). On a 409 `stale_recipient_keys` the reply is re-encrypted once to the keys Salt returns and resent; a second refusal is thrown. Needs a salt-agent-sdk release that passes these fields through `postMessage` (the key-reset release after 0.22.0); an older SDK ignores them.
+
 ## 0.1.1
 
 **Open rooms are actually detected now.** `isOpenRoom` compared `chat.encrypted === false` against
