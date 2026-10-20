@@ -16,7 +16,7 @@ and is not itself one of that file's subprojects).
 ## Commands
 
 ```bash
-npm install       # salt-agent-sdk ^0.28.0 resolves from the npm registry
+npm install       # salt-agent-sdk ^0.29.0 resolves from the npm registry
 npm test          # vitest run -- the whole suite, one invocation
 npx vitest run src/salt/rest.test.ts       # a single file
 npm run build     # tsc -p tsconfig.json -> dist/

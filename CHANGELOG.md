@@ -3,7 +3,7 @@
 ## 0.1.1
 
 **First registry release.** Install with `openclaw plugins install saltapp-openclaw` (npm) or
-`clawhub:saltapp-openclaw`. `salt-agent-sdk` is required at `^0.28.0` (was `^0.12.2`); the jump
+`clawhub:saltapp-openclaw`. `salt-agent-sdk` is required at `^0.29.0` (was `^0.12.2`); the jump
 needed no source change, and typecheck, build and all 63 tests pass against the registry copy. The
 lockfile is now committed and resolves registry tarballs only.
 
