@@ -459,3 +459,11 @@ Notes for that publish:
   the first publish, or the plugin shows the category glyph indefinitely
   (ClawHub only repairs missing icons from a release that already bundled
   one).
+
+## 2026-10-19: ClawHub listing, up to the login
+
+- `saltapp-openclaw` 0.1.1 is on npm. No existing ClawHub listing: `clawhub package explore saltapp` returned nothing and `package inspect saltapp-openclaw` said not found (clawhub CLI 0.23.3, run with `npx clawhub@latest`).
+- `clawhub package validate .` passed (Plugin Inspector: 0 breakages, 0 warnings). It writes a `reports/` folder into the repo; delete it.
+- `clawhub package publish . --dry-run --source-repo 0000F8/saltapp-openclaw --source-commit <HEAD> --source-ref main` listed 22 files and succeeded.
+- `clawhub whoami` says "Not logged in". Login is a device flow, so it was not attempted. Not published.
+- Owner runs: `npx clawhub@latest login`, then from this repo `npx clawhub@latest package publish . --owner <handle> --source-repo 0000F8/saltapp-openclaw --source-commit $(git rev-parse HEAD) --source-ref main --wait`. Afterwards: `clawhub package trusted-publisher set saltapp-openclaw --repository 0000F8/saltapp-openclaw --workflow-filename package-publish.yml`.
